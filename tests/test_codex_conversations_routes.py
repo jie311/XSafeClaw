@@ -997,6 +997,23 @@ def test_codex_conversation_resume_injects_developer_instructions(monkeypatch, t
     assert "baseInstructions" not in params
 
 
+def test_codex_conversation_response_does_not_promote_preview_to_title():
+    response = system_routes._codex_conversation_response(
+        {
+            "thread": {
+                "id": "thread-preview-only",
+                "sessionId": "session-preview-only",
+                "preview": "please create a polynomial derivative script with input validation and a command line demo",
+            }
+        },
+        instruction_hash="instruction-hash",
+        instruction_bytes=59,
+    )
+
+    assert response["title"] == "Codex"
+    assert response["preview"] == "please create a polynomial derivative script with input validation and a command line demo"
+
+
 def test_codex_title_generation_uses_ephemeral_thread_and_sets_real_thread_name(monkeypatch, tmp_path):
     codex_path = str(tmp_path / "codex.cmd")
     sent_messages: list[dict] = []

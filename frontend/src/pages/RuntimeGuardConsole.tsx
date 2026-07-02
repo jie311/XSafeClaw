@@ -4259,7 +4259,9 @@ export default function RuntimeGuardConsole() {
                 if (nextKey) {
                   const previousKey = activeKey;
                   const serverTitle = typeof chunk.title === 'string' ? chunk.title.trim() : '';
-                  const hasServerTitle = Boolean(serverTitle) && !isGeneratedCodexTitle(serverTitle);
+                  const hasServerTitle = Boolean(serverTitle)
+                    && !isGeneratedCodexTitle(serverTitle)
+                    && !runtimeTitleLooksLikeRawRequest(serverTitle);
                   const nextTitle = hasServerTitle
                     ? serverTitle
                     : provisionalCodexTitle;

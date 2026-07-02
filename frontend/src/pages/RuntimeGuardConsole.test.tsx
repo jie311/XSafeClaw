@@ -1444,7 +1444,7 @@ describe('NewTaskModal', () => {
           type: 'codex_session_started',
           thread_id: 'thread-started',
           session_key: 'codex:thread-started',
-          title: 'Codex',
+          title: 'please create a polynomial derivative script with input validation and a command line demo',
           preview: 'please create a polynomial derivative script with input validation and a command line demo',
           source: 'vscode',
           originator: 'XSafeClaw',

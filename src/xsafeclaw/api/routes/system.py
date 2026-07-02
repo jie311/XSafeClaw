@@ -1978,7 +1978,7 @@ def _codex_conversation_response(
     originator = _codex_thread_originator(thread, thread_id=thread_id, source=source)
     history_kind = _codex_history_kind(source, originator)
     preview = _first_string(thread.get("preview"))
-    title = _first_string(thread.get("name"), thread.get("title"), preview) or "Codex"
+    title = _first_string(thread.get("name"), thread.get("title")) or "Codex"
     return {
         "installed": True,
         "status": "ready",

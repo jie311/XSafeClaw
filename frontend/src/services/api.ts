@@ -311,6 +311,18 @@ export interface CodexConversationGoalClearResponse {
   cleared: boolean;
 }
 
+export interface CodexConversationTitleRequest {
+  thread_id: string;
+  message: string;
+  model?: string | null;
+  reasoning_effort?: string | null;
+  speed?: string | null;
+}
+
+export interface CodexConversationTitleResponse {
+  title: string;
+}
+
 export interface CodexUserInputAnswerPayload {
   answers: string[];
 }
@@ -1079,6 +1091,14 @@ export const systemAPI = {
   /** Resume a Codex app-server thread with XSafeClaw developer instructions. */
   resumeCodexConversation: (payload: CodexConversationResumeRequest) =>
     api.post<CodexConversationOpenResponse>('/system/codex/conversations/resume', payload, { timeout: 20000 }),
+
+  /** Generate and persist a short Codex thread title using an ephemeral app-server thread. */
+  generateCodexSessionTitle: (sessionKey: string, payload: CodexConversationTitleRequest) =>
+    api.post<CodexConversationTitleResponse>(
+      `/system/codex/conversations/${encodeURIComponent(sessionKey)}/title/generate`,
+      payload,
+      { timeout: 60000 },
+    ),
 
   /** Interrupt the active Codex app-server turn for a conversation. */
   interruptCodexConversation: (sessionKey: string, payload?: CodexConversationInterruptRequest) =>

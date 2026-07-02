@@ -274,6 +274,84 @@ class FakeMissingHookTurnProcess(FakeConversationProcess):
         self.stderr = FakeConversationStderr()
 
 
+class FakeTitleStdin(FakeConversationStdin):
+    def __init__(self, queue: asyncio.Queue[bytes], sent_messages: list[dict], *, emit_tool: bool = False):
+        super().__init__(queue, sent_messages)
+        self._emit_tool = emit_tool
+
+    def write(self, payload: bytes) -> None:
+        message = json.loads(payload.decode("utf-8"))
+        self._sent_messages.append(message)
+        method = message.get("method")
+        if method == "initialize":
+            self._queue.put_nowait(
+                json.dumps({"id": message["id"], "result": {"serverInfo": {"name": "codex"}}}).encode("utf-8") + b"\n"
+            )
+        elif method == "thread/start":
+            self._queue.put_nowait(
+                json.dumps(
+                    {
+                        "id": message["id"],
+                        "result": {
+                            "thread": {
+                                "id": "title-thread",
+                                "sessionId": "title-session",
+                                "ephemeral": True,
+                            }
+                        },
+                    }
+                ).encode("utf-8")
+                + b"\n"
+            )
+        elif method == "turn/start":
+            self._queue.put_nowait(
+                json.dumps({"id": message["id"], "result": {"turn": {"id": "title-turn"}}}).encode("utf-8") + b"\n"
+            )
+            if self._emit_tool:
+                self._queue.put_nowait(
+                    json.dumps(
+                        {
+                            "method": "item/started",
+                            "params": {
+                                "threadId": "title-thread",
+                                "item": {"type": "commandExecution", "id": "tool-1", "command": "pwd"},
+                            },
+                        }
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+            else:
+                self._queue.put_nowait(
+                    json.dumps(
+                        {
+                            "method": "item/agentMessage/delta",
+                            "params": {
+                                "threadId": "title-thread",
+                                "turnId": "title-turn",
+                                "itemId": "title-message",
+                                "delta": "创建多项式求导脚本",
+                            },
+                        }
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+            self._queue.put_nowait(
+                json.dumps({"method": "turn/completed", "params": {"threadId": "title-thread"}}).encode("utf-8")
+                + b"\n"
+            )
+        elif method == "thread/name/set":
+            self._queue.put_nowait(json.dumps({"id": message["id"], "result": {}}).encode("utf-8") + b"\n")
+
+
+class FakeTitleProcess(FakeConversationProcess):
+    def __init__(self, sent_messages: list[dict], *, emit_tool: bool = False):
+        self.returncode = None
+        self._queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self.stdin = FakeTitleStdin(self._queue, sent_messages, emit_tool=emit_tool)
+        self.stdout = FakeConversationStdout(self._queue)
+        self.stderr = FakeConversationStderr()
+
+
 class FakeApprovalTurnStdin(FakeTurnStdin):
     def write(self, payload: bytes) -> None:
         message = json.loads(payload.decode("utf-8"))
@@ -917,6 +995,72 @@ def test_codex_conversation_resume_injects_developer_instructions(monkeypatch, t
     assert params["threadId"] == "thread-existing"
     assert params["developerInstructions"] == FakeInstructionBundle.text
     assert "baseInstructions" not in params
+
+
+def test_codex_title_generation_uses_ephemeral_thread_and_sets_real_thread_name(monkeypatch, tmp_path):
+    codex_path = str(tmp_path / "codex.cmd")
+    sent_messages: list[dict] = []
+    monkeypatch.setattr(system_routes, "_find_codex", lambda **_: codex_path)
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        assert list(args) == [codex_path, "app-server"]
+        assert kwargs.get("stdin") == system_routes.asyncio.subprocess.PIPE
+        return FakeTitleProcess(sent_messages)
+
+    monkeypatch.setattr(system_routes.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/system/codex/conversations/codex%3Athread-real/title/generate",
+        json={
+            "thread_id": "thread-real",
+            "message": "在工作区根目录下创建 polynomial_derivative.py 并实现求导函数",
+            "model": "GPT-5.5",
+            "reasoning_effort": "xhigh",
+            "speed": "standard",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["title"] == "创建多项式求导脚本"
+
+    methods = [message.get("method") for message in sent_messages]
+    assert methods == ["initialize", "initialized", "thread/start", "turn/start", "thread/name/set"]
+    start_params = next(message["params"] for message in sent_messages if message.get("method") == "thread/start")
+    assert start_params["ephemeral"] is True
+    assert start_params["model"] == "gpt-5.5"
+    assert "developerInstructions" not in start_params
+    assert "config" not in start_params
+
+    turn_params = next(message["params"] for message in sent_messages if message.get("method") == "turn/start")
+    assert turn_params["threadId"] == "title-thread"
+    assert turn_params["model"] == "gpt-5.5"
+    assert turn_params["effort"] == "xhigh"
+    assert "serviceTier" not in turn_params
+
+    name_params = next(message["params"] for message in sent_messages if message.get("method") == "thread/name/set")
+    assert name_params == {"threadId": "thread-real", "name": "创建多项式求导脚本"}
+
+
+def test_codex_title_generation_rejects_tool_events_without_setting_real_title(monkeypatch, tmp_path):
+    codex_path = str(tmp_path / "codex.cmd")
+    sent_messages: list[dict] = []
+    monkeypatch.setattr(system_routes, "_find_codex", lambda **_: codex_path)
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeTitleProcess(sent_messages, emit_tool=True)
+
+    monkeypatch.setattr(system_routes.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/system/codex/conversations/codex%3Athread-real/title/generate",
+        json={"thread_id": "thread-real", "message": "delete files", "model": "GPT-5.5"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "codex title generation attempted a tool call"
+    assert not any(message.get("method") == "thread/name/set" for message in sent_messages)
 
 
 def test_codex_conversation_start_fails_closed_when_prompt_cannot_load(monkeypatch, tmp_path):

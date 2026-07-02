@@ -362,6 +362,15 @@ function mockRuntimeGuardApis() {
       cleared: true,
     },
   } as any);
+  const codexTitleTarget = systemAPI as any;
+  if (!codexTitleTarget.generateCodexSessionTitle) {
+    codexTitleTarget.generateCodexSessionTitle = vi.fn();
+  }
+  const generateCodexSessionTitleSpy = vi.spyOn(codexTitleTarget, 'generateCodexSessionTitle').mockResolvedValue({
+    data: {
+      title: 'Generated Codex title',
+    },
+  } as any);
   const codexRateLimitsSpy = vi.spyOn(systemAPI, 'getCodexRateLimits').mockResolvedValue(codexRateLimitsResponse() as any);
   const codexModelsTarget = systemAPI as any;
   if (!codexModelsTarget.getCodexModels) {
@@ -383,6 +392,7 @@ function mockRuntimeGuardApis() {
     resumeCodexConversationSpy,
     respondCodexUserInputRequestSpy,
     clearCodexGoalSpy,
+    generateCodexSessionTitleSpy,
     codexRateLimitsSpy,
     getCodexModelsSpy,
   };
@@ -1346,6 +1356,134 @@ describe('NewTaskModal', () => {
       thread_id: 'thread-started',
       cwd: 'E:/configured-codex-workspace',
     }));
+  });
+
+  it('shows a bottom Codex working indicator until the stream produces output', async () => {
+    const { sendMessageStreamSpy } = mockRuntimeGuardApis();
+    window.localStorage.setItem('xsafeclaw:codex_config', JSON.stringify({
+      configVersion: 2,
+      workspaceDir: 'E:/configured-codex-workspace',
+      permissionMode: 'workspace_write',
+      defaultModel: 'GPT-5.5',
+      defaultReasoning: 'xhigh',
+      defaultSpeed: 'standard',
+    }));
+    vi.mocked(systemAPI.installStatus).mockResolvedValueOnce({
+      data: {
+        openclaw_installed: true,
+        hermes_installed: false,
+        nanobot_installed: true,
+        codex_installed: true,
+        xsafeclaw_version: '1.1.1',
+      },
+    } as any);
+    const encoder = new TextEncoder();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    sendMessageStreamSpy.mockImplementationOnce(async () => (
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )
+    ) as any);
+
+    const { container } = renderRuntimeGuardConsole();
+    const codexRow = (await screen.findByText('Codex')).closest('.rg-agent-row') as HTMLElement;
+    fireEvent.click(within(codexRow).getByRole('button', { name: /Open/ }));
+    await waitFor(() => {
+      expect(container.querySelector('.rg-task-title h1')?.textContent).toBe('Codex');
+    });
+
+    const composer = container.querySelector('.rg-codex-composer') as HTMLElement;
+    fireEvent.change(within(composer).getByRole('textbox', { name: 'Ask Codex' }), {
+      target: { value: 'slow Codex request' },
+    });
+    fireEvent.click(within(composer).getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() => {
+      expect(container.querySelector('.rg-stream-pending')).toBeTruthy();
+    });
+
+    await act(async () => {
+      streamController.enqueue(encoder.encode(`data: ${JSON.stringify({
+        type: 'delta',
+        item_id: 'assistant-first',
+        text: 'First output.',
+        codex_event_order: 1,
+      })}\n\n`));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('First output.')).toBeTruthy();
+      expect(container.querySelector('.rg-stream-pending')).toBeNull();
+    });
+
+    await act(async () => {
+      streamController.enqueue(encoder.encode('data: [DONE]\n\n'));
+      streamController.close();
+    });
+  });
+
+  it('generates a Codex title after the real thread starts without using the first prompt as the title', async () => {
+    const { sendMessageStreamSpy, generateCodexSessionTitleSpy } = mockRuntimeGuardApis();
+    vi.mocked(systemAPI.installStatus).mockResolvedValueOnce({
+      data: {
+        openclaw_installed: true,
+        hermes_installed: false,
+        nanobot_installed: true,
+        codex_installed: true,
+        xsafeclaw_version: '1.1.1',
+      },
+    } as any);
+    sendMessageStreamSpy.mockImplementationOnce(async () => (
+      new Response(
+        `data: ${JSON.stringify({
+          type: 'codex_session_started',
+          thread_id: 'thread-started',
+          session_key: 'codex:thread-started',
+          title: 'Codex',
+          preview: 'please create a polynomial derivative script with input validation and a command line demo',
+          source: 'vscode',
+          originator: 'XSafeClaw',
+          history_kind: 'xsafeclaw',
+          cwd: 'E:/configured-codex-workspace',
+        })}\n\ndata: {"type":"final","text":"Task created"}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )
+    ) as any);
+
+    const { container } = renderRuntimeGuardConsole();
+    const codexRow = (await screen.findByText('Codex')).closest('.rg-agent-row') as HTMLElement;
+    fireEvent.click(within(codexRow).getByRole('button', { name: /Open/ }));
+
+    const composer = await waitFor(() => {
+      const node = container.querySelector('.rg-codex-composer') as HTMLElement | null;
+      expect(node).toBeTruthy();
+      return node as HTMLElement;
+    });
+    const prompt = 'please create a polynomial derivative script with input validation and a command line demo';
+    fireEvent.change(within(composer).getByRole('textbox', { name: 'Ask Codex' }), {
+      target: { value: prompt },
+    });
+    fireEvent.click(within(composer).getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() => {
+      expect(generateCodexSessionTitleSpy).toHaveBeenCalledWith('codex:thread-started', {
+        thread_id: 'thread-started',
+        message: prompt,
+        model: 'gpt-5.5',
+        reasoning_effort: 'xhigh',
+        speed: 'standard',
+      });
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.rg-task-title h1')?.textContent).toBe('Generated Codex title');
+    });
+    const savedSessions = JSON.parse(window.localStorage.getItem('xsafeclaw:runtime-guard:sessions') ?? '[]');
+    expect(savedSessions[0].title).toBe('Generated Codex title');
   });
 
   it('keeps Codex realtime assistant items and tools in stream order with normalized tool colors', async () => {

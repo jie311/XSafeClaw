@@ -2881,6 +2881,7 @@ export default function RuntimeGuardConsole() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const codexComposerRef = useRef<HTMLDivElement>(null);
   const inFlightKeysRef = useRef<Set<string>>(new Set());
+  const codexNativeTitleSessionKeysRef = useRef<Set<string>>(new Set());
   const approvalRefreshTimerRef = useRef<number | null>(null);
   const codexRateLimitsRequestRef = useRef(0);
   const demoCodexNewTaskShownRef = useRef(false);
@@ -3920,6 +3921,28 @@ export default function RuntimeGuardConsole() {
     )));
   }, []);
 
+  const requestCodexGeneratedTitle = useCallback((
+    sessionKey: string,
+    payload: {
+      thread_id: string;
+      message: string;
+      model?: string | null;
+      reasoning_effort?: string | null;
+      speed?: string | null;
+    },
+  ) => {
+    void systemAPI.generateCodexSessionTitle(sessionKey, payload)
+      .then(({ data }) => {
+        if (codexNativeTitleSessionKeysRef.current.has(sessionKey)) return;
+        applySessionTitle(sessionKey, data.title, payload.message);
+      })
+      .catch(() => {
+        if (codexNativeTitleSessionKeysRef.current.has(sessionKey)) return;
+        const fallbackTitle = compactCodexPromptTitle(payload.message) || 'Codex';
+        applySessionTitle(sessionKey, fallbackTitle, payload.message);
+      });
+  }, [applySessionTitle]);
+
   const submitCodexQuestionResponse = async (
     msg: ChatMessage,
     payload: CodexRequestUserInputResponseRequest,
@@ -4063,7 +4086,7 @@ export default function RuntimeGuardConsole() {
       const effectiveCodexGoalMode = options.codexGoalMode ?? codexGoalMode;
       const activity = new Date();
       const activityIso = activity.toISOString();
-      const provisionalCodexTitle = isGeneratedCodexTitle(session.title) ? compactCodexPromptTitle(text) : '';
+      const provisionalCodexTitle = '';
       const userMsg: ChatMessage = {
         id: uuidv4(),
         role: 'user',
@@ -4072,6 +4095,25 @@ export default function RuntimeGuardConsole() {
       };
       const pendingId = uuidv4();
       const fallbackAssistantId = `assistant-${pendingId}`;
+      const workingIndicatorId = `codex-working-${pendingId}`;
+      const stripCodexWorkingIndicator = (messages: ChatMessage[]) => (
+        messages.filter(message => message.id !== workingIndicatorId)
+      );
+      const removeCodexWorkingIndicator = (sessionKey: string) => {
+        setMessageMap(prev => {
+          const messages = prev[sessionKey] ?? [];
+          if (!messages.some(message => message.id === workingIndicatorId)) return prev;
+          return { ...prev, [sessionKey]: stripCodexWorkingIndicator(messages) };
+        });
+      };
+      const workingIndicatorMsg: ChatMessage = {
+        id: workingIndicatorId,
+        role: 'assistant',
+        content: '',
+        timestamp: activity,
+        pending: true,
+        codex_event_order: Number.MAX_SAFE_INTEGER,
+      };
 
       inFlightKeysRef.current.add(originalKey);
       chatStreamStore.setSending(originalKey, true);
@@ -4080,7 +4122,6 @@ export default function RuntimeGuardConsole() {
         session.sessionKey === originalKey
           ? {
               ...session,
-              title: provisionalCodexTitle || session.title,
               lastActivityAt: activityIso,
             }
           : session
@@ -4089,12 +4130,11 @@ export default function RuntimeGuardConsole() {
         session.sessionKey === originalKey
           ? {
               ...session,
-              title: provisionalCodexTitle || session.title,
               lastActivityAt: activityIso,
             }
           : session
       ))));
-      setMessageMap(prev => ({ ...prev, [originalKey]: [...(prev[originalKey] ?? []), userMsg] }));
+      setMessageMap(prev => ({ ...prev, [originalKey]: [...(prev[originalKey] ?? []), userMsg, workingIndicatorMsg] }));
 
       try {
         if (!activeThreadId && !session.sessionKey.startsWith('codex:pending:')) {
@@ -4187,7 +4227,7 @@ export default function RuntimeGuardConsole() {
               const appendStreamMessage = (message: ChatMessage) => {
                 sawCodexTimelineContent = true;
                 setMessageMap(prev => {
-                  const messages = [...(prev[activeKey] ?? [])];
+                  const messages = stripCodexWorkingIndicator(prev[activeKey] ?? []);
                   messages.push(message);
                   return { ...prev, [activeKey]: messages };
                 });
@@ -4199,7 +4239,7 @@ export default function RuntimeGuardConsole() {
               ) => {
                 sawCodexTimelineContent = true;
                 setMessageMap(prev => {
-                  const messages = [...(prev[activeKey] ?? [])];
+                  const messages = stripCodexWorkingIndicator(prev[activeKey] ?? []);
                   const existingIndex = messages.findIndex(item => item.id === messageId);
                   if (existingIndex >= 0) {
                     messages[existingIndex] = buildMessage(messages[existingIndex]);
@@ -4218,11 +4258,11 @@ export default function RuntimeGuardConsole() {
                 }
                 if (nextKey) {
                   const previousKey = activeKey;
-                  const nextTitle = typeof chunk.title === 'string' && chunk.title.trim() && !isGeneratedCodexTitle(chunk.title)
-                    ? chunk.title.trim()
-                    : typeof chunk.preview === 'string' && chunk.preview.trim()
-                      ? compactCodexPromptTitle(chunk.preview)
-                      : provisionalCodexTitle;
+                  const serverTitle = typeof chunk.title === 'string' ? chunk.title.trim() : '';
+                  const hasServerTitle = Boolean(serverTitle) && !isGeneratedCodexTitle(serverTitle);
+                  const nextTitle = hasServerTitle
+                    ? serverTitle
+                    : provisionalCodexTitle;
                   if (nextKey !== previousKey) {
                     renameSessionKey(previousKey, nextKey);
                     chatStreamStore.setSending(previousKey, false);
@@ -4267,10 +4307,23 @@ export default function RuntimeGuardConsole() {
                     delete next[previousKey];
                     return next;
                   });
+                  if (!hasServerTitle && nextThreadId) {
+                    requestCodexGeneratedTitle(nextKey, {
+                      thread_id: nextThreadId,
+                      message: text,
+                      model: sessionCodexModel,
+                      reasoning_effort: sessionCodexReasoningLevel,
+                      speed: sessionCodexSpeed,
+                    });
+                  }
                 }
               } else if (chunk.type === 'codex_thread_title') {
                 const nextTitle = typeof chunk.title === 'string' ? chunk.title.trim() : '';
                 if (nextTitle) {
+                  codexNativeTitleSessionKeysRef.current.add(activeKey);
+                  if (chunk.thread_id) {
+                    codexNativeTitleSessionKeysRef.current.add(`codex:${chunk.thread_id}`);
+                  }
                   const applyTitle = (item: RuntimeGuardSession) => {
                     const matchesSession = item.sessionKey === activeKey
                       || (chunk.thread_id && item.historySessionId === chunk.thread_id)
@@ -4508,7 +4561,7 @@ export default function RuntimeGuardConsole() {
         }
       } catch (err: any) {
         setMessageMap(prev => {
-          const messages = [...(prev[activeKey] ?? prev[originalKey] ?? [])];
+          const messages = stripCodexWorkingIndicator(prev[activeKey] ?? prev[originalKey] ?? []);
           messages.push({
             id: `error-${uuidv4()}`,
             role: 'error' as const,
@@ -4519,6 +4572,8 @@ export default function RuntimeGuardConsole() {
           return { ...prev, [activeKey]: messages };
         });
       } finally {
+        removeCodexWorkingIndicator(originalKey);
+        removeCodexWorkingIndicator(activeKey);
         chatStreamStore.setSending(originalKey, false);
         chatStreamStore.setSending(activeKey, false);
         inFlightKeysRef.current.delete(originalKey);

@@ -1713,6 +1713,14 @@ class CodexConversationGoalClearRequest(BaseModel):
     thread_id: str | None = None
 
 
+class CodexConversationTitleRequest(BaseModel):
+    thread_id: str = Field(..., min_length=1)
+    message: str = Field(..., min_length=1)
+    model: str | None = None
+    reasoning_effort: str | None = None
+    speed: str | None = "standard"
+
+
 class CodexUserInputAnswer(BaseModel):
     answers: list[str]
 
@@ -3010,6 +3018,130 @@ async def _open_codex_conversation_via_app_server(
                 await stderr_task
 
 
+def _codex_title_prompt(message: str) -> str:
+    request_text = re.sub(r"\s+", " ", str(message or "")).strip()[:1600]
+    return (
+        "Generate a concise user-facing title for this Codex conversation.\n"
+        "Return only the title text. Do not use tools. Do not answer the request.\n"
+        "If the request is Chinese, use Chinese. If it is English, use English.\n"
+        "Chinese titles should be at most 14 characters; English titles should be at most 6 words.\n\n"
+        f"User request:\n{request_text}"
+    )
+
+
+def _codex_clean_generated_title(raw_title: str, fallback: str = "") -> str:
+    title = guard_service.clean_runtime_session_title(str(raw_title or ""), fallback=fallback)
+    if not title or title == "New session":
+        return ""
+    return title
+
+
+def _codex_title_generation_tool_error(message: dict[str, Any]) -> str | None:
+    method = _first_string(message.get("method")) or ""
+    if method in {"item/tool/requestUserInput", "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"}:
+        return "codex title generation attempted a tool call"
+    if method in {"item/started", "item/completed"}:
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        item = params.get("item") if isinstance(params.get("item"), dict) else {}
+        item_type = _first_string(item.get("type"))
+        if item_type and item_type not in {"agentMessage"}:
+            return "codex title generation attempted a tool call"
+    return None
+
+
+async def _generate_codex_conversation_title(
+    codex_path: str,
+    payload: CodexConversationTitleRequest,
+    *,
+    env: dict | None = None,
+    timeout_s: float = 30.0,
+) -> str:
+    proc: asyncio.subprocess.Process | None = None
+    stderr_task: asyncio.Task[bytes] | None = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *_build_codex_app_server_command(codex_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env or _build_env(),
+        )
+        if proc.stderr is not None:
+            stderr_task = asyncio.create_task(proc.stderr.read())
+
+        await _codex_app_server_initialize(proc, timeout_s=timeout_s)
+
+        model_id = _codex_model_id(payload.model)
+        start_params: dict[str, Any] = {"ephemeral": True}
+        if model_id:
+            start_params["model"] = model_id
+        await _codex_app_server_send(proc, {"id": 2, "method": "thread/start", "params": start_params})
+        start_result = await _codex_app_server_response(proc, 2, timeout_s=timeout_s)
+        thread = _codex_thread_read_thread(start_result) or {}
+        title_thread_id = _first_string(thread.get("id"), thread.get("threadId"), start_result.get("threadId"))
+        if not title_thread_id:
+            raise CodexAppServerError("codex title generation did not return an ephemeral thread id")
+
+        turn_params: dict[str, Any] = {
+            "threadId": title_thread_id,
+            "input": [{"type": "text", "text": _codex_title_prompt(payload.message), "text_elements": []}],
+        }
+        if model_id:
+            turn_params["model"] = model_id
+        if payload.reasoning_effort:
+            turn_params["effort"] = payload.reasoning_effort
+        service_tier = _codex_service_tier(payload.speed, model_id)
+        if service_tier:
+            turn_params["serviceTier"] = service_tier
+
+        await _codex_app_server_send(proc, {"id": 3, "method": "turn/start", "params": turn_params})
+        await _codex_app_server_response(proc, 3, timeout_s=timeout_s)
+
+        raw_title_parts: list[str] = []
+        while True:
+            message = await _read_codex_jsonrpc_message(proc, timeout_s=timeout_s)
+            tool_error = _codex_title_generation_tool_error(message)
+            if tool_error:
+                raise CodexAppServerError(tool_error)
+            method = _first_string(message.get("method")) or ""
+            params = message.get("params") if isinstance(message.get("params"), dict) else {}
+            if method == "item/agentMessage/delta":
+                raw_title_parts.append(_first_string(params.get("delta")) or "")
+            elif method == "item/completed":
+                item = params.get("item") if isinstance(params.get("item"), dict) else {}
+                item_type = _first_string(item.get("type"))
+                if item_type == "agentMessage":
+                    text = _first_string(item.get("text"), item.get("content"))
+                    if text:
+                        raw_title_parts.append(text)
+            elif method == "error":
+                raise CodexAppServerError(_first_string(params.get("message"), params.get("error")) or "codex title generation failed")
+            elif method == "turn/completed":
+                break
+
+        title = _codex_clean_generated_title("".join(raw_title_parts), fallback="")
+        if not title:
+            raise CodexAppServerError("codex title generation returned an empty title")
+
+        await _codex_app_server_send(
+            proc,
+            {
+                "id": 4,
+                "method": "thread/name/set",
+                "params": {"threadId": payload.thread_id, "name": title},
+            },
+        )
+        await _codex_app_server_response(proc, 4, timeout_s=timeout_s)
+        return title
+    finally:
+        if proc is not None and proc.returncode is None:
+            await _terminate_process_tree(proc)
+        if stderr_task is not None and not stderr_task.done():
+            stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await stderr_task
+
+
 def _codex_turn_items(turn: dict[str, Any]) -> list[dict[str, Any]]:
     raw_items = turn.get("items")
     if not isinstance(raw_items, list):
@@ -4249,6 +4381,31 @@ async def codex_conversation_resume(payload: CodexConversationResumeRequest):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except TimeoutError as exc:
         raise HTTPException(status_code=500, detail="codex app-server timed out") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/codex/conversations/{session_key}/title/generate")
+async def codex_conversation_title_generate(session_key: str, payload: CodexConversationTitleRequest):
+    """Generate a Codex conversation title through an ephemeral app-server thread."""
+    env = _build_env()
+    codex_path = _find_codex(env=env)
+    if not codex_path:
+        raise HTTPException(status_code=404, detail="codex executable not found")
+    if not payload.message.strip():
+        raise HTTPException(status_code=400, detail="message is required")
+    if not payload.thread_id.strip():
+        raise HTTPException(status_code=400, detail="thread id is required")
+    inferred_thread_id = _codex_thread_id_from_session_key(session_key)
+    if inferred_thread_id and inferred_thread_id != payload.thread_id:
+        raise HTTPException(status_code=400, detail="session key does not match thread id")
+    try:
+        title = await _generate_codex_conversation_title(codex_path, payload, env=env)
+        return {"title": title}
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="codex title generation timed out") from exc
+    except CodexAppServerError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

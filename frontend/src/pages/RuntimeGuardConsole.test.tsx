@@ -1222,6 +1222,7 @@ describe('NewTaskModal', () => {
       getHistorySpy,
       sendMessageStreamSpy,
       startCodexConversationSpy,
+      generateCodexSessionTitleSpy,
     } = mockRuntimeGuardApis();
     window.localStorage.setItem('xsafeclaw:codex_config', JSON.stringify({
       configVersion: 2,
@@ -1319,6 +1320,16 @@ describe('NewTaskModal', () => {
     expect(screen.queryByText('This is a Codex frontend preview session. Backend data is not connected yet.')).toBeNull();
 
     await waitFor(() => {
+      expect(generateCodexSessionTitleSpy).toHaveBeenCalledWith('codex:thread-started', {
+        thread_id: 'thread-started',
+        message: 'hello Codex',
+        model: 'gpt-5.5',
+        reasoning_effort: 'xhigh',
+        speed: 'standard',
+      });
+    });
+
+    await waitFor(() => {
       const savedSessions = JSON.parse(window.localStorage.getItem('xsafeclaw:runtime-guard:sessions') ?? '[]');
       expect(savedSessions[0]).toEqual(expect.objectContaining({
         agent: 'Codex',
@@ -1326,7 +1337,7 @@ describe('NewTaskModal', () => {
         historySessionId: 'thread-started',
         instanceId: 'codex-cli',
         platform: 'codex',
-        title: 'Official Codex title',
+        title: 'Generated Codex title',
         codexHistoryKind: 'xsafeclaw',
         codexOriginator: 'XSafeClaw',
         workspacePath: 'E:/configured-codex-workspace',
@@ -1486,6 +1497,70 @@ describe('NewTaskModal', () => {
     expect(savedSessions[0].title).toBe('Generated Codex title');
   });
 
+  it('generates a Codex title when opening a history row whose title looks like a raw request', async () => {
+    const { generateCodexSessionTitleSpy } = mockRuntimeGuardApis();
+    vi.mocked(systemAPI.installStatus).mockResolvedValue({
+      data: {
+        openclaw_installed: true,
+        hermes_installed: false,
+        nanobot_installed: true,
+        codex_installed: true,
+        xsafeclaw_version: '1.1.1',
+      },
+    } as any);
+    const rawTitle = 'please create a polynomial derivative script with input validation and a command line demo';
+    vi.mocked(systemAPI.listCodexSessions).mockResolvedValueOnce({
+      data: {
+        installed: true,
+        status: 'ready',
+        sessions: [
+          {
+            id: 'thread-raw-title',
+            session_id: 'thread-raw-title',
+            title: rawTitle,
+            preview: rawTitle,
+            cwd: 'E:/work/codex-demo',
+            created_at: '2026-06-15T12:00:00Z',
+            updated_at: '2026-06-15T13:00:00Z',
+            status: 'idle',
+            source: 'vscode',
+            originator: 'XSafeClaw',
+            history_kind: 'xsafeclaw',
+            deletable: true,
+            path: 'C:/Users/heng/.codex/sessions/rollout-thread-raw-title.jsonl',
+            cli_version: '0.139.0',
+          },
+        ],
+        next_cursor: null,
+        message: '',
+        error: null,
+      },
+    } as any);
+
+    const { container } = renderRuntimeGuardConsole();
+    const row = await waitFor(() => {
+      const node = container.querySelector('.rg-left-history-row') as HTMLElement | null;
+      expect(node).toBeTruthy();
+      return node as HTMLElement;
+    });
+    expect(generateCodexSessionTitleSpy).not.toHaveBeenCalled();
+
+    fireEvent.click(row);
+
+    await waitFor(() => {
+      expect(generateCodexSessionTitleSpy).toHaveBeenCalledWith('codex:thread-raw-title', {
+        thread_id: 'thread-raw-title',
+        message: rawTitle,
+        model: 'gpt-5.5',
+        reasoning_effort: 'xhigh',
+        speed: 'standard',
+      });
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.rg-task-title h1')?.textContent).toBe('Generated Codex title');
+    });
+  });
+
   it('keeps the temporary Codex title when generated title lookup fails', async () => {
     const { sendMessageStreamSpy, generateCodexSessionTitleSpy } = mockRuntimeGuardApis();
     let rejectTitle: ((reason?: unknown) => void) | undefined;
@@ -1493,7 +1568,7 @@ describe('NewTaskModal', () => {
       rejectTitle = reject;
     });
     generateCodexSessionTitleSpy.mockReturnValueOnce(titlePromise as any);
-    vi.mocked(systemAPI.installStatus).mockResolvedValueOnce({
+    vi.mocked(systemAPI.installStatus).mockResolvedValue({
       data: {
         openclaw_installed: true,
         hermes_installed: false,
@@ -1562,7 +1637,7 @@ describe('NewTaskModal', () => {
       defaultReasoning: 'xhigh',
       defaultSpeed: 'standard',
     }));
-    vi.mocked(systemAPI.installStatus).mockResolvedValueOnce({
+    vi.mocked(systemAPI.installStatus).mockResolvedValue({
       data: {
         openclaw_installed: true,
         hermes_installed: false,
@@ -1783,7 +1858,7 @@ describe('NewTaskModal', () => {
 
   it('rereads Codex configure localStorage for every new pending Codex session', async () => {
     const { startCodexConversationSpy } = mockRuntimeGuardApis();
-    vi.mocked(systemAPI.installStatus).mockResolvedValueOnce({
+    vi.mocked(systemAPI.installStatus).mockResolvedValue({
       data: {
         openclaw_installed: true,
         hermes_installed: false,

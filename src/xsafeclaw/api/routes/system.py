@@ -3022,9 +3022,11 @@ def _codex_title_prompt(message: str) -> str:
     request_text = re.sub(r"\s+", " ", str(message or "")).strip()[:1600]
     return (
         "Generate a concise user-facing title for this Codex conversation.\n"
+        "Summarize the task intent; do not copy or paraphrase the full request.\n"
         "Return only the title text. Do not use tools. Do not answer the request.\n"
+        "Do not use Markdown, bullets, quotes, punctuation wrappers, or a trailing period.\n"
         "If the request is Chinese, use Chinese. If it is English, use English.\n"
-        "Chinese titles should be at most 14 characters; English titles should be at most 6 words.\n\n"
+        "Chinese titles should be 4 to 12 characters when possible; English titles should be 2 to 6 words.\n\n"
         f"User request:\n{request_text}"
     )
 

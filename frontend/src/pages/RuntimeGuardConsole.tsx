@@ -132,6 +132,7 @@ export type RuntimeGuardSession = {
   lastActivityAt?: string;
   status: 'ready' | 'error';
   autoTitlePending?: boolean;
+  codexTitleState?: 'temporary' | 'generated_pending' | 'generated_applied';
   frontendOnly?: boolean;
   codexHistory?: boolean;
   codexHistoryKind?: string | null;
@@ -958,6 +959,9 @@ function loadRuntimeGuardSessions(): RuntimeGuardSession[] {
           lastActivityAt: typeof item?.lastActivityAt === 'string' ? item.lastActivityAt : undefined,
           status: item?.status === 'error' ? 'error' : 'ready',
           autoTitlePending: Boolean(item?.autoTitlePending),
+          codexTitleState: ['temporary', 'generated_pending', 'generated_applied'].includes(item?.codexTitleState)
+            ? item.codexTitleState
+            : undefined,
           frontendOnly: isFrontendCodex || Boolean(item?.frontendOnly),
           codexHistory,
         };
@@ -1271,10 +1275,6 @@ export function titleFromUserMessage(input: string, fallback = ''): string {
     : compactFallback || fallbackCleaned;
   if (!safeTitle) return '';
   return safeTitle.length > 48 ? `${safeTitle.slice(0, 48).trimEnd()}...` : safeTitle;
-}
-
-function isGeneratedCodexTitle(title: string | undefined): boolean {
-  return /^Codex(?:\s+\d+)?$/i.test((title || '').trim());
 }
 
 function sseNumber(value: unknown): number | undefined {
@@ -2877,7 +2877,7 @@ export default function RuntimeGuardConsole() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const codexComposerRef = useRef<HTMLDivElement>(null);
   const inFlightKeysRef = useRef<Set<string>>(new Set());
-  const codexNativeTitleSessionKeysRef = useRef<Set<string>>(new Set());
+  const codexGeneratedTitleRequestKeysRef = useRef<Set<string>>(new Set());
   const approvalRefreshTimerRef = useRef<number | null>(null);
   const codexRateLimitsRequestRef = useRef(0);
   const demoCodexNewTaskShownRef = useRef(false);
@@ -3605,6 +3605,7 @@ export default function RuntimeGuardConsole() {
       lastActivityAt: now,
       status: 'ready',
       autoTitlePending: false,
+      codexTitleState: 'temporary',
       frontendOnly: true,
       codexModel: nextModel,
       codexReasoningLevel: currentCodexConfig.defaultReasoning,
@@ -3917,6 +3918,21 @@ export default function RuntimeGuardConsole() {
     )));
   }, []);
 
+  const applyCodexGeneratedTitle = useCallback((sessionKey: string, title: string) => {
+    const nextTitle = titleFromUserMessage(title, '');
+    if (!nextTitle) return;
+    setSessions(current => current.map(session => (
+      session.sessionKey === sessionKey
+        ? { ...session, title: nextTitle, autoTitlePending: false, codexTitleState: 'generated_applied' }
+        : session
+    )));
+    setSessionHistoryItems(current => current.map(session => (
+      session.sessionKey === sessionKey
+        ? { ...session, title: nextTitle, autoTitlePending: false, codexTitleState: 'generated_applied' }
+        : session
+    )));
+  }, []);
+
   const requestCodexGeneratedTitle = useCallback((
     sessionKey: string,
     payload: {
@@ -3927,15 +3943,48 @@ export default function RuntimeGuardConsole() {
       speed?: string | null;
     },
   ) => {
+    if (codexGeneratedTitleRequestKeysRef.current.has(sessionKey)) return;
+    codexGeneratedTitleRequestKeysRef.current.add(sessionKey);
     void systemAPI.generateCodexSessionTitle(sessionKey, payload)
       .then(({ data }) => {
-        if (codexNativeTitleSessionKeysRef.current.has(sessionKey)) return;
-        applySessionTitle(sessionKey, data.title, payload.message);
+        applyCodexGeneratedTitle(sessionKey, data.title);
       })
       .catch(() => {
-        // Keep the temporary "Codex N" title until Codex returns a real title.
+        codexGeneratedTitleRequestKeysRef.current.delete(sessionKey);
+        // Keep the temporary "Codex N" title until XSafeClaw can generate a real title.
       });
-  }, [applySessionTitle]);
+  }, [applyCodexGeneratedTitle]);
+
+  useEffect(() => {
+    if (!activeSession?.codexHistory || !activeSession.historySessionId) return;
+    if (!runtimeTitleLooksLikeRawRequest(activeSession.title)) return;
+    setSessions(current => current.map(session => (
+      session.sessionKey === activeSession.sessionKey
+        ? { ...session, codexTitleState: 'generated_pending' }
+        : session
+    )));
+    setSessionHistoryItems(current => current.map(session => (
+      session.sessionKey === activeSession.sessionKey
+        ? { ...session, codexTitleState: 'generated_pending' }
+        : session
+    )));
+    requestCodexGeneratedTitle(activeSession.sessionKey, {
+      thread_id: activeSession.historySessionId,
+      message: activeSession.title,
+      model: codexModel,
+      reasoning_effort: codexReasoningLevel,
+      speed: codexSpeed,
+    });
+  }, [
+    activeSession?.codexHistory,
+    activeSession?.historySessionId,
+    activeSession?.sessionKey,
+    activeSession?.title,
+    codexModel,
+    codexReasoningLevel,
+    codexSpeed,
+    requestCodexGeneratedTitle,
+  ]);
 
   const submitCodexQuestionResponse = async (
     msg: ChatMessage,
@@ -4251,10 +4300,6 @@ export default function RuntimeGuardConsole() {
                 }
                 if (nextKey) {
                   const previousKey = activeKey;
-                  const serverTitle = typeof chunk.title === 'string' ? chunk.title.trim() : '';
-                  const hasServerTitle = Boolean(serverTitle)
-                    && !isGeneratedCodexTitle(serverTitle)
-                    && !runtimeTitleLooksLikeRawRequest(serverTitle);
                   if (nextKey !== previousKey) {
                     renameSessionKey(previousKey, nextKey);
                     chatStreamStore.setSending(previousKey, false);
@@ -4273,7 +4318,7 @@ export default function RuntimeGuardConsole() {
                           codexHistoryKind: chunk.history_kind ?? item.codexHistoryKind ?? 'xsafeclaw',
                           codexOriginator: chunk.originator ?? item.codexOriginator ?? 'XSafeClaw',
                           codexDeletable: chunk.deletable ?? item.codexDeletable ?? true,
-                          title: hasServerTitle ? serverTitle : item.title,
+                          codexTitleState: nextThreadId ? 'generated_pending' : item.codexTitleState,
                           workspacePath: chunk.cwd || item.workspacePath,
                         }
                       : item
@@ -4288,7 +4333,7 @@ export default function RuntimeGuardConsole() {
                           codexHistoryKind: chunk.history_kind ?? item.codexHistoryKind ?? 'xsafeclaw',
                           codexOriginator: chunk.originator ?? item.codexOriginator ?? 'XSafeClaw',
                           codexDeletable: chunk.deletable ?? item.codexDeletable ?? true,
-                          title: hasServerTitle ? serverTitle : item.title,
+                          codexTitleState: nextThreadId ? 'generated_pending' : item.codexTitleState,
                           workspacePath: chunk.cwd || item.workspacePath,
                         }
                       : item
@@ -4299,7 +4344,7 @@ export default function RuntimeGuardConsole() {
                     delete next[previousKey];
                     return next;
                   });
-                  if (!hasServerTitle && nextThreadId) {
+                  if (nextThreadId) {
                     requestCodexGeneratedTitle(nextKey, {
                       thread_id: nextThreadId,
                       message: text,
@@ -4310,21 +4355,10 @@ export default function RuntimeGuardConsole() {
                   }
                 }
               } else if (chunk.type === 'codex_thread_title') {
-                const nextTitle = typeof chunk.title === 'string' ? chunk.title.trim() : '';
-                if (nextTitle) {
-                  codexNativeTitleSessionKeysRef.current.add(activeKey);
-                  if (chunk.thread_id) {
-                    codexNativeTitleSessionKeysRef.current.add(`codex:${chunk.thread_id}`);
-                  }
-                  const applyTitle = (item: RuntimeGuardSession) => {
-                    const matchesSession = item.sessionKey === activeKey
-                      || (chunk.thread_id && item.historySessionId === chunk.thread_id)
-                      || (chunk.thread_id && item.sessionKey === `codex:${chunk.thread_id}`);
-                    return matchesSession ? { ...item, title: nextTitle, autoTitlePending: false } : item;
-                  };
-                  setSessions(current => current.map(applyTitle));
-                  setSessionHistoryItems(current => sortSessionsNewestFirst(current.map(applyTitle)));
-                }
+                // XSafeClaw does not trust Codex app-server's automatic thread titles:
+                // they can be the raw first user request. The separate ephemeral
+                // title generator is the only source that updates Codex titles.
+                void chunk.title;
               } else if (chunk.type === 'codex_assistant_start' && chunk.item_id) {
                 const assistantId = `assistant-${chunk.item_id}`;
                 const metadata = codexMetadataFromChunk(chunk);

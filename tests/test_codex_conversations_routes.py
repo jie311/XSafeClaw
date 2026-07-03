@@ -1062,6 +1062,9 @@ def test_codex_title_generation_uses_ephemeral_thread_and_sets_real_thread_name(
     assert turn_params["model"] == "gpt-5.5"
     assert turn_params["effort"] == "xhigh"
     assert "serviceTier" not in turn_params
+    title_prompt = turn_params["input"][0]["text"]
+    assert "Summarize the task intent" in title_prompt
+    assert "do not copy" in title_prompt
 
     name_params = next(message["params"] for message in sent_messages if message.get("method") == "thread/name/set")
     assert name_params == {"threadId": "thread-real", "name": "创建多项式求导脚本"}

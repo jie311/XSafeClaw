@@ -3033,6 +3033,10 @@ def _codex_clean_generated_title(raw_title: str, fallback: str = "") -> str:
     title = guard_service.clean_runtime_session_title(str(raw_title or ""), fallback=fallback)
     if not title or title == "New session":
         return ""
+    if re.fullmatch(r"codex(?:\s+(?:cli|session|\d+))?", title, flags=re.IGNORECASE):
+        return ""
+    if guard_service._runtime_title_violates_generated_length(title):  # pyright: ignore[reportPrivateUsage]
+        return ""
     return title
 
 

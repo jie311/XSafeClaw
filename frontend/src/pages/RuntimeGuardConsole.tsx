@@ -1273,10 +1273,6 @@ export function titleFromUserMessage(input: string, fallback = ''): string {
   return safeTitle.length > 48 ? `${safeTitle.slice(0, 48).trimEnd()}...` : safeTitle;
 }
 
-function compactCodexPromptTitle(input: string): string {
-  return titleFromUserMessage(input, input) || input.replace(/\s+/g, ' ').trim().slice(0, 48);
-}
-
 function isGeneratedCodexTitle(title: string | undefined): boolean {
   return /^Codex(?:\s+\d+)?$/i.test((title || '').trim());
 }
@@ -3593,7 +3589,7 @@ export default function RuntimeGuardConsole() {
 
     const now = new Date().toISOString();
     const sameAgentCount = sessions.filter(session => session.agent === 'Codex').length + 1;
-    const fallbackLabel = sameAgentCount === 1 ? 'Codex' : `Codex ${sameAgentCount}`;
+    const fallbackLabel = `Codex ${sameAgentCount}`;
     const seedSessionKey = typeof seed?.session_key === 'string' && seed.session_key.startsWith('codex:pending:')
       ? seed.session_key
       : '';
@@ -3937,9 +3933,7 @@ export default function RuntimeGuardConsole() {
         applySessionTitle(sessionKey, data.title, payload.message);
       })
       .catch(() => {
-        if (codexNativeTitleSessionKeysRef.current.has(sessionKey)) return;
-        const fallbackTitle = compactCodexPromptTitle(payload.message) || 'Codex';
-        applySessionTitle(sessionKey, fallbackTitle, payload.message);
+        // Keep the temporary "Codex N" title until Codex returns a real title.
       });
   }, [applySessionTitle]);
 
@@ -4086,7 +4080,6 @@ export default function RuntimeGuardConsole() {
       const effectiveCodexGoalMode = options.codexGoalMode ?? codexGoalMode;
       const activity = new Date();
       const activityIso = activity.toISOString();
-      const provisionalCodexTitle = '';
       const userMsg: ChatMessage = {
         id: uuidv4(),
         role: 'user',
@@ -4262,9 +4255,6 @@ export default function RuntimeGuardConsole() {
                   const hasServerTitle = Boolean(serverTitle)
                     && !isGeneratedCodexTitle(serverTitle)
                     && !runtimeTitleLooksLikeRawRequest(serverTitle);
-                  const nextTitle = hasServerTitle
-                    ? serverTitle
-                    : provisionalCodexTitle;
                   if (nextKey !== previousKey) {
                     renameSessionKey(previousKey, nextKey);
                     chatStreamStore.setSending(previousKey, false);
@@ -4283,7 +4273,7 @@ export default function RuntimeGuardConsole() {
                           codexHistoryKind: chunk.history_kind ?? item.codexHistoryKind ?? 'xsafeclaw',
                           codexOriginator: chunk.originator ?? item.codexOriginator ?? 'XSafeClaw',
                           codexDeletable: chunk.deletable ?? item.codexDeletable ?? true,
-                          title: nextTitle || item.title,
+                          title: hasServerTitle ? serverTitle : item.title,
                           workspacePath: chunk.cwd || item.workspacePath,
                         }
                       : item
@@ -4298,7 +4288,7 @@ export default function RuntimeGuardConsole() {
                           codexHistoryKind: chunk.history_kind ?? item.codexHistoryKind ?? 'xsafeclaw',
                           codexOriginator: chunk.originator ?? item.codexOriginator ?? 'XSafeClaw',
                           codexDeletable: chunk.deletable ?? item.codexDeletable ?? true,
-                          title: nextTitle || item.title,
+                          title: hasServerTitle ? serverTitle : item.title,
                           workspacePath: chunk.cwd || item.workspacePath,
                         }
                       : item

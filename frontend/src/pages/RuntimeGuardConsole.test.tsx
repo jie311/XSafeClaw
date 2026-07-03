@@ -796,7 +796,7 @@ describe('NewTaskModal', () => {
 
   it('opens the Codex configure page from the Codex row context menu', async () => {
     mockRuntimeGuardApis();
-    vi.mocked(systemAPI.installStatus).mockResolvedValueOnce({
+    vi.mocked(systemAPI.installStatus).mockResolvedValue({
       data: {
         openclaw_installed: true,
         hermes_installed: false,
@@ -817,7 +817,7 @@ describe('NewTaskModal', () => {
 
   it('shows Codex first and hides Nanobot in the sidebar agents list', async () => {
     mockRuntimeGuardApis();
-    vi.mocked(systemAPI.installStatus).mockResolvedValueOnce({
+    vi.mocked(systemAPI.installStatus).mockResolvedValue({
       data: {
         openclaw_installed: true,
         hermes_installed: false,
@@ -1246,7 +1246,7 @@ describe('NewTaskModal', () => {
     fireEvent.click(within(codexRow).getByRole('button', { name: /Open/ }));
 
     await waitFor(() => {
-      expect(container.querySelector('.rg-task-title h1')?.textContent).toBe('Codex');
+      expect(container.querySelector('.rg-task-title h1')?.textContent).toBe('Codex 1');
     });
 
     expect(startCodexConversationSpy).not.toHaveBeenCalled();
@@ -1262,7 +1262,7 @@ describe('NewTaskModal', () => {
         displayName: 'Codex CLI',
         instanceId: 'codex-cli',
         platform: 'codex',
-        title: 'Codex',
+        title: 'Codex 1',
         workspacePath: 'E:/configured-codex-workspace',
         frontendOnly: true,
       }));
@@ -1394,7 +1394,7 @@ describe('NewTaskModal', () => {
     const codexRow = (await screen.findByText('Codex')).closest('.rg-agent-row') as HTMLElement;
     fireEvent.click(within(codexRow).getByRole('button', { name: /Open/ }));
     await waitFor(() => {
-      expect(container.querySelector('.rg-task-title h1')?.textContent).toBe('Codex');
+      expect(container.querySelector('.rg-task-title h1')?.textContent).toBe('Codex 1');
     });
 
     const composer = container.querySelector('.rg-codex-composer') as HTMLElement;
@@ -1484,6 +1484,72 @@ describe('NewTaskModal', () => {
     });
     const savedSessions = JSON.parse(window.localStorage.getItem('xsafeclaw:runtime-guard:sessions') ?? '[]');
     expect(savedSessions[0].title).toBe('Generated Codex title');
+  });
+
+  it('keeps the temporary Codex title when generated title lookup fails', async () => {
+    const { sendMessageStreamSpy, generateCodexSessionTitleSpy } = mockRuntimeGuardApis();
+    let rejectTitle: ((reason?: unknown) => void) | undefined;
+    const titlePromise = new Promise((_, reject) => {
+      rejectTitle = reject;
+    });
+    generateCodexSessionTitleSpy.mockReturnValueOnce(titlePromise as any);
+    vi.mocked(systemAPI.installStatus).mockResolvedValueOnce({
+      data: {
+        openclaw_installed: true,
+        hermes_installed: false,
+        nanobot_installed: true,
+        codex_installed: true,
+        xsafeclaw_version: '1.1.1',
+      },
+    } as any);
+    const prompt = 'please create a polynomial derivative script with input validation and a command line demo';
+    sendMessageStreamSpy.mockImplementationOnce(async () => (
+      new Response(
+        `data: ${JSON.stringify({
+          type: 'codex_session_started',
+          thread_id: 'thread-started',
+          session_key: 'codex:thread-started',
+          title: prompt,
+          preview: prompt,
+          source: 'vscode',
+          originator: 'XSafeClaw',
+          history_kind: 'xsafeclaw',
+          cwd: 'E:/configured-codex-workspace',
+        })}\n\ndata: {"type":"final","text":"Task created"}\n\ndata: [DONE]\n\n`,
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      )
+    ) as any);
+
+    const { container } = renderRuntimeGuardConsole();
+    const codexRow = (await screen.findByText('Codex')).closest('.rg-agent-row') as HTMLElement;
+    fireEvent.click(within(codexRow).getByRole('button', { name: /Open/ }));
+
+    const composer = await waitFor(() => {
+      const node = container.querySelector('.rg-codex-composer') as HTMLElement | null;
+      expect(node).toBeTruthy();
+      return node as HTMLElement;
+    });
+    fireEvent.change(within(composer).getByRole('textbox', { name: 'Ask Codex' }), {
+      target: { value: prompt },
+    });
+    fireEvent.click(within(composer).getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() => {
+      expect(generateCodexSessionTitleSpy).toHaveBeenCalled();
+    });
+    const temporaryTitle = container.querySelector('.rg-task-title h1')?.textContent ?? '';
+    expect(temporaryTitle).toMatch(/^Codex \d+$/);
+
+    await act(async () => {
+      rejectTitle?.(new Error('title unavailable'));
+      await titlePromise.catch(() => undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('.rg-task-title h1')?.textContent).toBe(temporaryTitle);
+    const savedSessions = JSON.parse(window.localStorage.getItem('xsafeclaw:runtime-guard:sessions') ?? '[]');
+    expect(savedSessions[0].title).toBe(temporaryTitle);
   });
 
   it('keeps Codex realtime assistant items and tools in stream order with normalized tool colors', async () => {

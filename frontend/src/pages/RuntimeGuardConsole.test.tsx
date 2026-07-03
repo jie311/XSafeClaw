@@ -268,6 +268,7 @@ function mockRuntimeGuardApis() {
       openclaw_installed: true,
       hermes_installed: false,
       nanobot_installed: true,
+      codex_installed: true,
       xsafeclaw_version: '1.1.1',
     },
   } as any);
@@ -901,7 +902,7 @@ describe('NewTaskModal', () => {
 
   it('shows only the icon and session title in sidebar history rows', async () => {
     mockRuntimeGuardApis();
-    vi.mocked(systemAPI.installStatus).mockResolvedValueOnce({
+    vi.mocked(systemAPI.installStatus).mockResolvedValue({
       data: {
         openclaw_installed: true,
         hermes_installed: true,
@@ -910,7 +911,27 @@ describe('NewTaskModal', () => {
         xsafeclaw_version: '1.1.1',
       },
     } as any);
+    vi.mocked(systemAPI.listCodexSessions).mockResolvedValue({
+      data: {
+        installed: true,
+        status: 'ready',
+        sessions: [],
+        next_cursor: null,
+        message: '',
+        error: null,
+      },
+    } as any);
     window.localStorage.setItem('xsafeclaw:runtime-guard:sessions', JSON.stringify([
+      {
+        sessionKey: 'openclaw-login-title',
+        agent: 'OpenClaw',
+        platform: 'openclaw',
+        instanceId: 'runtime-openclaw',
+        title: '\u6211\u73b0\u5728\u7684\u767b\u5f55\u60c5\u51b5',
+        createdAt: '2035-06-16T14:30:00.000Z',
+        lastActivityAt: '2035-06-16T14:30:00.000Z',
+        status: 'ready',
+      },
       {
         sessionKey: 'codex:thread-login',
         historySessionId: 'thread-login',
@@ -919,8 +940,8 @@ describe('NewTaskModal', () => {
         instanceId: 'codex-cli',
         codexHistory: true,
         title: '我现在的登录情况',
-        createdAt: '2026-06-15T14:30:00.000Z',
-        lastActivityAt: '2026-06-15T14:30:00.000Z',
+        createdAt: '2030-06-16T14:30:00.000Z',
+        lastActivityAt: '2030-06-16T14:30:00.000Z',
         status: 'ready',
       },
       {
@@ -928,9 +949,19 @@ describe('NewTaskModal', () => {
         agent: 'Hermes',
         platform: 'hermes',
         instanceId: 'runtime-hermes',
+        title: '\u6211\u73b0\u5728\u7684\u767b\u5f55\u60c5\u51b5',
+        createdAt: '2032-06-15T08:18:00.000Z',
+        lastActivityAt: '2032-06-15T08:18:00.000Z',
+        status: 'ready',
+      },
+      {
+        sessionKey: 'hermes-session-secondary',
+        agent: 'Hermes',
+        platform: 'hermes',
+        instanceId: 'runtime-hermes',
         title: 'sess-local',
-        createdAt: '2026-06-15T08:18:00.000Z',
-        lastActivityAt: '2026-06-15T08:18:00.000Z',
+        createdAt: '2034-06-15T08:18:00.000Z',
+        lastActivityAt: '2034-06-15T08:18:00.000Z',
         status: 'ready',
       },
     ]));
@@ -939,7 +970,10 @@ describe('NewTaskModal', () => {
     const rows = await waitFor(() => {
       const nextRows = Array.from(container.querySelectorAll('.rg-left-history-row')) as HTMLElement[];
       expect(nextRows.length).toBeGreaterThanOrEqual(2);
-      return nextRows;
+      return nextRows.sort((left, right) => (
+        Number(left.textContent?.includes('Generated Codex title') ?? false)
+        - Number(right.textContent?.includes('Generated Codex title') ?? false)
+      ));
     });
 
     expect(rows[0].querySelector('.rg-agent-badge')).toBeTruthy();
@@ -1440,7 +1474,8 @@ describe('NewTaskModal', () => {
 
   it('generates a Codex title after the real thread starts without using the first prompt as the title', async () => {
     const { sendMessageStreamSpy, generateCodexSessionTitleSpy } = mockRuntimeGuardApis();
-    vi.mocked(systemAPI.installStatus).mockResolvedValueOnce({
+    vi.mocked(systemAPI.installStatus).mockReset();
+    vi.mocked(systemAPI.installStatus).mockResolvedValue({
       data: {
         openclaw_installed: true,
         hermes_installed: false,
@@ -1561,6 +1596,71 @@ describe('NewTaskModal', () => {
     });
   });
 
+  it('does not display a Chinese raw Codex prompt as the history title while title generation is pending', async () => {
+    const { generateCodexSessionTitleSpy } = mockRuntimeGuardApis();
+    vi.mocked(systemAPI.installStatus).mockResolvedValue({
+      data: {
+        openclaw_installed: true,
+        hermes_installed: false,
+        nanobot_installed: true,
+        codex_installed: true,
+        xsafeclaw_version: '1.1.1',
+      },
+    } as any);
+    const rawTitle = '\u5728\u5de5\u4f5c\u533a\u6839\u76ee\u5f55\u4e0b\u521b\u5efa\u4e00\u4e2a Python \u811a\u672c\uff0c\u6587\u4ef6\u540d\u4e3a statistics_calculator.py';
+    vi.mocked(systemAPI.listCodexSessions).mockResolvedValueOnce({
+      data: {
+        installed: true,
+        status: 'ready',
+        sessions: [
+          {
+            id: 'thread-chinese-raw-title',
+            session_id: 'thread-chinese-raw-title',
+            title: rawTitle,
+            preview: rawTitle,
+            cwd: 'E:/work/codex-demo',
+            created_at: '2026-06-15T12:00:00Z',
+            updated_at: '2026-06-15T13:00:00Z',
+            status: 'idle',
+            source: 'vscode',
+            originator: 'XSafeClaw',
+            history_kind: 'xsafeclaw',
+            deletable: true,
+            path: 'C:/Users/heng/.codex/sessions/rollout-thread-chinese-raw-title.jsonl',
+            cli_version: '0.139.0',
+          },
+        ],
+        next_cursor: null,
+        message: '',
+        error: null,
+      },
+    } as any);
+
+    const { container } = renderRuntimeGuardConsole();
+    const row = await waitFor(() => {
+      const node = container.querySelector('.rg-left-history-row') as HTMLElement | null;
+      expect(node).toBeTruthy();
+      return node as HTMLElement;
+    });
+    expect(row.textContent).not.toContain('\u5728\u5de5\u4f5c\u533a\u6839\u76ee\u5f55\u4e0b\u521b\u5efa');
+    expect(generateCodexSessionTitleSpy).not.toHaveBeenCalled();
+
+    fireEvent.click(row);
+
+    await waitFor(() => {
+      expect(generateCodexSessionTitleSpy).toHaveBeenCalledWith('codex:thread-chinese-raw-title', {
+        thread_id: 'thread-chinese-raw-title',
+        message: rawTitle,
+        model: 'gpt-5.5',
+        reasoning_effort: 'xhigh',
+        speed: 'standard',
+      });
+    });
+    await waitFor(() => {
+      expect(container.querySelector('.rg-task-title h1')?.textContent).toBe('Generated Codex title');
+    });
+  });
+
   it('keeps the temporary Codex title when generated title lookup fails', async () => {
     const { sendMessageStreamSpy, generateCodexSessionTitleSpy } = mockRuntimeGuardApis();
     let rejectTitle: ((reason?: unknown) => void) | undefined;
@@ -1637,6 +1737,7 @@ describe('NewTaskModal', () => {
       defaultReasoning: 'xhigh',
       defaultSpeed: 'standard',
     }));
+    vi.mocked(systemAPI.installStatus).mockReset();
     vi.mocked(systemAPI.installStatus).mockResolvedValue({
       data: {
         openclaw_installed: true,

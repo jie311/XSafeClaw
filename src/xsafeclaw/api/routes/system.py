@@ -3031,11 +3031,32 @@ def _codex_title_prompt(message: str) -> str:
     )
 
 
-def _codex_clean_generated_title(raw_title: str, fallback: str = "") -> str:
+def _codex_title_overlap_text(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip().casefold()
+
+
+def _codex_generated_title_looks_like_request_prefix(title: str, source_message: str) -> bool:
+    title_text = _codex_title_overlap_text(title)
+    source_text = _codex_title_overlap_text(source_message)
+    if not title_text or not source_text:
+        return False
+    if len(source_text) <= len(title_text) + 4:
+        return False
+    if len(title_text) >= 4 and source_text.startswith(title_text):
+        return True
+    prefix_window = source_text[: max(48, len(title_text) * 3)]
+    return len(title_text) >= 8 and title_text in prefix_window
+
+
+def _codex_clean_generated_title(raw_title: str, *, source_message: str = "", fallback: str = "") -> str:
     title = guard_service.clean_runtime_session_title(str(raw_title or ""), fallback=fallback)
     if not title or title == "New session":
         return ""
     if re.fullmatch(r"codex(?:\s+(?:cli|session|\d+))?", title, flags=re.IGNORECASE):
+        return ""
+    if guard_service._runtime_title_looks_like_request(title):  # pyright: ignore[reportPrivateUsage]
+        return ""
+    if _codex_generated_title_looks_like_request_prefix(title, source_message):
         return ""
     if guard_service._runtime_title_violates_generated_length(title):  # pyright: ignore[reportPrivateUsage]
         return ""
@@ -3050,7 +3071,7 @@ def _codex_title_generation_tool_error(message: dict[str, Any]) -> str | None:
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         item = params.get("item") if isinstance(params.get("item"), dict) else {}
         item_type = _first_string(item.get("type"))
-        if item_type and item_type not in {"agentMessage"}:
+        if item_type and item_type not in {"userMessage", "reasoning", "agentMessage"}:
             return "codex title generation attempted a tool call"
     return None
 
@@ -3104,6 +3125,7 @@ async def _generate_codex_conversation_title(
         await _codex_app_server_response(proc, 3, timeout_s=timeout_s)
 
         raw_title_parts: list[str] = []
+        completed_agent_text = ""
         while True:
             message = await _read_codex_jsonrpc_message(proc, timeout_s=timeout_s)
             tool_error = _codex_title_generation_tool_error(message)
@@ -3119,13 +3141,14 @@ async def _generate_codex_conversation_title(
                 if item_type == "agentMessage":
                     text = _first_string(item.get("text"), item.get("content"))
                     if text:
-                        raw_title_parts.append(text)
+                        completed_agent_text = text
             elif method == "error":
                 raise CodexAppServerError(_first_string(params.get("message"), params.get("error")) or "codex title generation failed")
             elif method == "turn/completed":
                 break
 
-        title = _codex_clean_generated_title("".join(raw_title_parts), fallback="")
+        raw_title = "".join(raw_title_parts) or completed_agent_text
+        title = _codex_clean_generated_title(raw_title, source_message=payload.message, fallback="")
         if not title:
             raise CodexAppServerError("codex title generation returned an empty title")
 

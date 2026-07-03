@@ -133,6 +133,7 @@ export type RuntimeGuardSession = {
   status: 'ready' | 'error';
   autoTitlePending?: boolean;
   codexTitleState?: 'temporary' | 'generated_pending' | 'generated_applied';
+  codexTitleSourceMessage?: string;
   frontendOnly?: boolean;
   codexHistory?: boolean;
   codexHistoryKind?: string | null;
@@ -832,7 +833,18 @@ export function codexSessionRecordToRuntimeGuardSession(
   if (!id) return null;
   const createdAt = firstText(record.created_at, record.updated_at) || new Date().toISOString();
   const lastActivityAt = firstText(record.updated_at, record.created_at, createdAt);
-  const title = firstText(record.title, record.preview) || `Codex ${id.slice(0, 8)}`;
+  const historyKind = record.history_kind ?? (record.source === 'cli' ? 'cli' : null);
+  const isXSafeClawHistory = historyKind === 'xsafeclaw' || record.originator === 'XSafeClaw';
+  const explicitTitle = firstText(record.title);
+  const preview = firstText(record.preview);
+  const explicitTitleIsRaw = Boolean(explicitTitle && runtimeTitleLooksLikeRawRequest(explicitTitle));
+  const title = explicitTitle && !explicitTitleIsRaw
+    ? explicitTitle
+    : (!isXSafeClawHistory && preview ? preview : `Codex ${id.slice(0, 8)}`);
+  const needsGeneratedTitle = isXSafeClawHistory && (!explicitTitle || explicitTitleIsRaw);
+  const codexTitleSourceMessage = needsGeneratedTitle && explicitTitleIsRaw
+    ? explicitTitle
+    : (needsGeneratedTitle && preview && runtimeTitleLooksLikeRawRequest(preview) ? preview : undefined);
 
   return {
     sessionKey: `codex:${id}`,
@@ -847,9 +859,11 @@ export function codexSessionRecordToRuntimeGuardSession(
     lastActivityAt,
     status: 'ready',
     autoTitlePending: false,
+    codexTitleState: explicitTitle && !explicitTitleIsRaw ? 'generated_applied' : 'temporary',
+    codexTitleSourceMessage,
     frontendOnly: true,
     codexHistory: true,
-    codexHistoryKind: record.history_kind ?? null,
+    codexHistoryKind: historyKind,
     codexOriginator: record.originator ?? null,
     codexDeletable: record.deletable ?? true,
   };
@@ -946,6 +960,18 @@ function loadRuntimeGuardSessions(): RuntimeGuardSession[] {
         }
         const sessionAgent = (isFrontendCodex ? 'Codex' : agent) as AgentName;
         const sessionPlatform = (isFrontendCodex ? 'codex' : platform) as RuntimeGuardSessionPlatform;
+        const storedTitle = typeof item?.title === 'string' ? item.title : '';
+        const storedTitleState = ['temporary', 'generated_pending', 'generated_applied'].includes(item?.codexTitleState)
+          ? item.codexTitleState
+          : undefined;
+        const storedCodexTitleIsRaw = isFrontendCodex && runtimeTitleLooksLikeRawRequest(storedTitle);
+        const normalizedTitle = isFrontendCodex
+          ? (
+            storedCodexTitleIsRaw
+              ? (storedTitle.match(/^Codex(?:\s+\d+)?$/i) ? storedTitle : 'Codex')
+              : (titleFromUserMessage(storedTitle, sessionAgent) || sessionAgent)
+          )
+          : (titleFromUserMessage(storedTitle, sessionAgent) || sessionAgent);
         return {
           sessionKey,
           historySessionId,
@@ -954,14 +980,15 @@ function loadRuntimeGuardSessions(): RuntimeGuardSession[] {
           instanceId: typeof item?.instanceId === 'string' ? item.instanceId : '',
           displayName: typeof item?.displayName === 'string' ? item.displayName : undefined,
           workspacePath: typeof item?.workspacePath === 'string' ? item.workspacePath : undefined,
-          title: titleFromUserMessage(typeof item?.title === 'string' ? item.title : '', sessionAgent) || sessionAgent,
+          title: normalizedTitle,
           createdAt: typeof item?.createdAt === 'string' ? item.createdAt : new Date().toISOString(),
           lastActivityAt: typeof item?.lastActivityAt === 'string' ? item.lastActivityAt : undefined,
           status: item?.status === 'error' ? 'error' : 'ready',
           autoTitlePending: Boolean(item?.autoTitlePending),
-          codexTitleState: ['temporary', 'generated_pending', 'generated_applied'].includes(item?.codexTitleState)
-            ? item.codexTitleState
-            : undefined,
+          codexTitleState: storedCodexTitleIsRaw ? 'temporary' : storedTitleState,
+          codexTitleSourceMessage: typeof item?.codexTitleSourceMessage === 'string'
+            ? item.codexTitleSourceMessage
+            : (storedCodexTitleIsRaw ? storedTitle : undefined),
           frontendOnly: isFrontendCodex || Boolean(item?.frontendOnly),
           codexHistory,
         };
@@ -1255,6 +1282,15 @@ function runtimeTitleLooksLikeRawRequest(input: string): boolean {
   if (runtimeTitleRequestPatterns.some(pattern => pattern.test(cleaned))) return true;
   const cjkCount = cleaned.match(runtimeTitleCjkPattern)?.length ?? 0;
   runtimeTitleCjkPattern.lastIndex = 0;
+  if (
+    cjkCount >= 8
+    && /^(?:请|帮我|帮忙|我想|我要|首先|先|在.*?(?:工作区|根目录|目录).*?(?:创建|删除|修改|实现|生成|编写|写入|新建)|(?:创建|编写|实现).{4,})/.test(cleaned)
+  ) {
+    return true;
+  }
+  if (cjkCount >= 12 && /(?:文件名为|该脚本需|命令行|工作区|根目录|函数|实现[:：]?)/.test(cleaned)) {
+    return true;
+  }
   if (cjkCount > 10 && /[?？]|吗|呢|怎么样|怎么|为什么|是否|难不难|简单|容易|帮我|请/.test(cleaned)) {
     return true;
   }
@@ -3923,14 +3959,43 @@ export default function RuntimeGuardConsole() {
     if (!nextTitle) return;
     setSessions(current => current.map(session => (
       session.sessionKey === sessionKey
-        ? { ...session, title: nextTitle, autoTitlePending: false, codexTitleState: 'generated_applied' }
+        ? {
+            ...session,
+            title: nextTitle,
+            autoTitlePending: false,
+            codexTitleState: 'generated_applied',
+            codexTitleSourceMessage: undefined,
+          }
         : session
     )));
     setSessionHistoryItems(current => current.map(session => (
       session.sessionKey === sessionKey
-        ? { ...session, title: nextTitle, autoTitlePending: false, codexTitleState: 'generated_applied' }
+        ? {
+            ...session,
+            title: nextTitle,
+            autoTitlePending: false,
+            codexTitleState: 'generated_applied',
+            codexTitleSourceMessage: undefined,
+          }
         : session
     )));
+  }, []);
+
+  const keepTemporaryCodexTitle = useCallback((sessionKey: string) => {
+    const normalize = (session: RuntimeGuardSession): RuntimeGuardSession => {
+      if (session.sessionKey !== sessionKey || session.platform !== 'codex') return session;
+      if (session.codexTitleState === 'generated_applied') return session;
+      const currentTitle = session.title.trim();
+      const temporaryTitle = currentTitle && /^Codex(?:\s+\d+)?$/i.test(currentTitle) ? currentTitle : 'Codex';
+      return {
+        ...session,
+        title: temporaryTitle,
+        autoTitlePending: false,
+        codexTitleState: 'temporary',
+      };
+    };
+    setSessions(current => current.map(normalize));
+    setSessionHistoryItems(current => current.map(normalize));
   }, []);
 
   const requestCodexGeneratedTitle = useCallback((
@@ -3951,13 +4016,18 @@ export default function RuntimeGuardConsole() {
       })
       .catch(() => {
         codexGeneratedTitleRequestKeysRef.current.delete(sessionKey);
-        // Keep the temporary "Codex N" title until XSafeClaw can generate a real title.
+        keepTemporaryCodexTitle(sessionKey);
       });
-  }, [applyCodexGeneratedTitle]);
+  }, [applyCodexGeneratedTitle, keepTemporaryCodexTitle]);
 
   useEffect(() => {
     if (!activeSession?.codexHistory || !activeSession.historySessionId) return;
-    if (!runtimeTitleLooksLikeRawRequest(activeSession.title)) return;
+    const sourceMessage = activeSession.codexTitleSourceMessage || activeSession.title;
+    if (!sourceMessage || /^Codex(?:\s+\d+)?$/i.test(sourceMessage.trim())) return;
+    const shouldGenerateTitle = activeSession.codexTitleState !== 'generated_applied'
+      || runtimeTitleLooksLikeRawRequest(activeSession.title)
+      || runtimeTitleLooksLikeRawRequest(sourceMessage);
+    if (!shouldGenerateTitle) return;
     setSessions(current => current.map(session => (
       session.sessionKey === activeSession.sessionKey
         ? { ...session, codexTitleState: 'generated_pending' }
@@ -3970,7 +4040,7 @@ export default function RuntimeGuardConsole() {
     )));
     requestCodexGeneratedTitle(activeSession.sessionKey, {
       thread_id: activeSession.historySessionId,
-      message: activeSession.title,
+      message: sourceMessage,
       model: codexModel,
       reasoning_effort: codexReasoningLevel,
       speed: codexSpeed,
@@ -3980,6 +4050,8 @@ export default function RuntimeGuardConsole() {
     activeSession?.historySessionId,
     activeSession?.sessionKey,
     activeSession?.title,
+    activeSession?.codexTitleSourceMessage,
+    activeSession?.codexTitleState,
     codexModel,
     codexReasoningLevel,
     codexSpeed,
@@ -4319,6 +4391,7 @@ export default function RuntimeGuardConsole() {
                           codexOriginator: chunk.originator ?? item.codexOriginator ?? 'XSafeClaw',
                           codexDeletable: chunk.deletable ?? item.codexDeletable ?? true,
                           codexTitleState: nextThreadId ? 'generated_pending' : item.codexTitleState,
+                          codexTitleSourceMessage: nextThreadId ? text : item.codexTitleSourceMessage,
                           workspacePath: chunk.cwd || item.workspacePath,
                         }
                       : item
@@ -4334,6 +4407,7 @@ export default function RuntimeGuardConsole() {
                           codexOriginator: chunk.originator ?? item.codexOriginator ?? 'XSafeClaw',
                           codexDeletable: chunk.deletable ?? item.codexDeletable ?? true,
                           codexTitleState: nextThreadId ? 'generated_pending' : item.codexTitleState,
+                          codexTitleSourceMessage: nextThreadId ? text : item.codexTitleSourceMessage,
                           workspacePath: chunk.cwd || item.workspacePath,
                         }
                       : item

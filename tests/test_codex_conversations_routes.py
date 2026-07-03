@@ -282,10 +282,12 @@ class FakeTitleStdin(FakeConversationStdin):
         *,
         emit_tool: bool = False,
         title_delta: str | None = None,
+        emit_normal_items: bool = False,
     ):
         super().__init__(queue, sent_messages)
         self._emit_tool = emit_tool
         self._title_delta = title_delta
+        self._emit_normal_items = emit_normal_items
 
     def write(self, payload: bytes) -> None:
         message = json.loads(payload.decode("utf-8"))
@@ -329,6 +331,50 @@ class FakeTitleStdin(FakeConversationStdin):
                     + b"\n"
                 )
             else:
+                if self._emit_normal_items:
+                    for event in [
+                        {
+                            "method": "item/started",
+                            "params": {
+                                "threadId": "title-thread",
+                                "turnId": "title-turn",
+                                "item": {"type": "userMessage", "id": "title-user", "text": "create script"},
+                            },
+                        },
+                        {
+                            "method": "item/completed",
+                            "params": {
+                                "threadId": "title-thread",
+                                "turnId": "title-turn",
+                                "item": {"type": "userMessage", "id": "title-user", "text": "create script"},
+                            },
+                        },
+                        {
+                            "method": "item/started",
+                            "params": {
+                                "threadId": "title-thread",
+                                "turnId": "title-turn",
+                                "item": {"type": "reasoning", "id": "title-reasoning", "summary": []},
+                            },
+                        },
+                        {
+                            "method": "item/completed",
+                            "params": {
+                                "threadId": "title-thread",
+                                "turnId": "title-turn",
+                                "item": {"type": "reasoning", "id": "title-reasoning", "summary": []},
+                            },
+                        },
+                        {
+                            "method": "item/started",
+                            "params": {
+                                "threadId": "title-thread",
+                                "turnId": "title-turn",
+                                "item": {"type": "agentMessage", "id": "title-message"},
+                            },
+                        },
+                    ]:
+                        self._queue.put_nowait(json.dumps(event).encode("utf-8") + b"\n")
                 self._queue.put_nowait(
                     json.dumps(
                         {
@@ -343,6 +389,24 @@ class FakeTitleStdin(FakeConversationStdin):
                     ).encode("utf-8")
                     + b"\n"
                 )
+                if self._emit_normal_items:
+                    self._queue.put_nowait(
+                        json.dumps(
+                            {
+                                "method": "item/completed",
+                                "params": {
+                                    "threadId": "title-thread",
+                                    "turnId": "title-turn",
+                                    "item": {
+                                        "type": "agentMessage",
+                                        "id": "title-message",
+                                        "text": self._title_delta or "Title fallback",
+                                    },
+                                },
+                            }
+                        ).encode("utf-8")
+                        + b"\n"
+                    )
             self._queue.put_nowait(
                 json.dumps({"method": "turn/completed", "params": {"threadId": "title-thread"}}).encode("utf-8")
                 + b"\n"
@@ -352,10 +416,23 @@ class FakeTitleStdin(FakeConversationStdin):
 
 
 class FakeTitleProcess(FakeConversationProcess):
-    def __init__(self, sent_messages: list[dict], *, emit_tool: bool = False, title_delta: str | None = None):
+    def __init__(
+        self,
+        sent_messages: list[dict],
+        *,
+        emit_tool: bool = False,
+        title_delta: str | None = None,
+        emit_normal_items: bool = False,
+    ):
         self.returncode = None
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
-        self.stdin = FakeTitleStdin(self._queue, sent_messages, emit_tool=emit_tool, title_delta=title_delta)
+        self.stdin = FakeTitleStdin(
+            self._queue,
+            sent_messages,
+            emit_tool=emit_tool,
+            title_delta=title_delta,
+            emit_normal_items=emit_normal_items,
+        )
         self.stdout = FakeConversationStdout(self._queue)
         self.stderr = FakeConversationStderr()
 
@@ -1070,6 +1147,33 @@ def test_codex_title_generation_uses_ephemeral_thread_and_sets_real_thread_name(
     assert name_params == {"threadId": "thread-real", "name": "创建多项式求导脚本"}
 
 
+def test_codex_title_generation_allows_user_message_and_reasoning_items(monkeypatch, tmp_path):
+    codex_path = str(tmp_path / "codex.cmd")
+    sent_messages: list[dict] = []
+    generated_title = "\u7edf\u8ba1\u811a\u672c\u5f00\u53d1"
+    monkeypatch.setattr(system_routes, "_find_codex", lambda **_: codex_path)
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeTitleProcess(sent_messages, title_delta=generated_title, emit_normal_items=True)
+
+    monkeypatch.setattr(system_routes.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/system/codex/conversations/codex%3Athread-real/title/generate",
+        json={
+            "thread_id": "thread-real",
+            "message": "\u5728\u5de5\u4f5c\u533a\u6839\u76ee\u5f55\u4e0b\u521b\u5efa\u4e00\u4e2a\u7edf\u8ba1\u811a\u672c",
+            "model": "GPT-5.5",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["title"] == generated_title
+    name_params = next(message["params"] for message in sent_messages if message.get("method") == "thread/name/set")
+    assert name_params == {"threadId": "thread-real", "name": generated_title}
+
+
 def test_codex_title_generation_rejects_tool_events_without_setting_real_title(monkeypatch, tmp_path):
     codex_path = str(tmp_path / "codex.cmd")
     sent_messages: list[dict] = []
@@ -1099,6 +1203,32 @@ def test_codex_title_generation_rejects_raw_request_without_setting_real_title(m
 
     async def fake_create_subprocess_exec(*_args, **_kwargs):
         return FakeTitleProcess(sent_messages, title_delta=raw_request)
+
+    monkeypatch.setattr(system_routes.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/system/codex/conversations/codex%3Athread-real/title/generate",
+        json={"thread_id": "thread-real", "message": raw_request, "model": "GPT-5.5"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "codex title generation returned an empty title"
+    assert not any(message.get("method") == "thread/name/set" for message in sent_messages)
+
+
+def test_codex_title_generation_rejects_chinese_request_prefix_without_setting_real_title(monkeypatch, tmp_path):
+    codex_path = str(tmp_path / "codex.cmd")
+    sent_messages: list[dict] = []
+    raw_prefix = "\u5728\u5de5\u4f5c\u533a\u6839\u76ee\u5f55\u4e0b\u521b\u5efa"
+    raw_request = (
+        "\u5728\u5de5\u4f5c\u533a\u6839\u76ee\u5f55\u4e0b\u521b\u5efa\u4e00\u4e2a Python "
+        "\u811a\u672c\uff0c\u6587\u4ef6\u540d\u4e3a statistics_calculator.py"
+    )
+    monkeypatch.setattr(system_routes, "_find_codex", lambda **_: codex_path)
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeTitleProcess(sent_messages, title_delta=raw_prefix)
 
     monkeypatch.setattr(system_routes.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     client = TestClient(app)

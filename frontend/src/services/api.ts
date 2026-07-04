@@ -105,6 +105,13 @@ export interface InstallStatusResponse {
   nanobot_version: string | null;
   nanobot_error?: string | null;
   nanobot_path: string | null;
+  codex_installed?: boolean;
+  codex_version?: string | null;
+  codex_error?: string | null;
+  codex_path?: string | null;
+  codex_configured?: boolean;
+  codex_status?: 'missing' | 'installed' | 'needs_login' | 'ready' | 'warning' | 'error' | string;
+  codex_warnings?: string[];
   config_exists: boolean;
   nanobot_config_exists: boolean;
   nanobot_model_configured: boolean;
@@ -118,6 +125,210 @@ export interface InstallStatusResponse {
   requires_nanobot_setup: boolean;
   requires_nanobot_configure: boolean;
   node_version: string;
+}
+
+export type CodexAuthStatus = 'logged_in' | 'logged_out' | 'missing' | 'error';
+export type CodexAuthMode = 'chatgpt' | 'api_key' | 'access_token' | 'unknown' | null;
+export type CodexRuntimeStatus = 'missing' | 'installed' | 'needs_login' | 'ready' | 'warning' | 'error';
+
+export interface CodexAuthStatusResponse {
+  installed: boolean;
+  logged_in: boolean;
+  auth_mode: CodexAuthMode;
+  status: CodexAuthStatus;
+  codex_path: string | null;
+  message: string;
+  error: string | null;
+}
+
+export interface CodexRuntimeStatusResponse {
+  installed: boolean;
+  configured: boolean;
+  status: CodexRuntimeStatus;
+  version: string | null;
+  path: string | null;
+  entry_path: string | null;
+  install_context: string | null;
+  warnings: string[];
+  error: string | null;
+}
+
+export type CodexModelCatalogStatus = 'ready' | 'missing' | 'error' | string;
+
+export interface CodexSpeedTierOption {
+  id: string;
+  name: string;
+  description: string | null;
+  service_tier: string | null;
+}
+
+export interface CodexModelCatalogItem {
+  id: string;
+  model: string;
+  display_name: string;
+  is_default: boolean;
+  default_reasoning_effort: string | null;
+  supported_reasoning_efforts: string[];
+  service_tiers: CodexSpeedTierOption[];
+}
+
+export interface CodexModelCatalogResponse {
+  installed: boolean;
+  status: CodexModelCatalogStatus;
+  source: string | null;
+  models: CodexModelCatalogItem[];
+  message: string;
+  error: string | null;
+}
+
+export type CodexRateLimitStatus = 'ready' | 'missing' | 'logged_out' | 'unsupported' | 'error' | string;
+
+export interface CodexRateLimitWindow {
+  remaining_percent: number | null;
+  used_percent: number | null;
+  resets_at: number | null;
+}
+
+export interface CodexRateLimitsResponse {
+  installed: boolean;
+  status: CodexRateLimitStatus;
+  five_hour: CodexRateLimitWindow;
+  seven_day: CodexRateLimitWindow;
+  plan_type: string | null;
+  message: string;
+  error: string | null;
+}
+
+export type CodexSessionListStatus = 'ready' | 'missing' | 'error' | string;
+
+export interface CodexSessionRecord {
+  id: string;
+  session_id: string | null;
+  title: string | null;
+  preview: string | null;
+  cwd: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  status: string | null;
+  source: string | null;
+  originator?: string | null;
+  history_kind?: 'cli' | 'xsafeclaw' | string | null;
+  deletable?: boolean;
+  path: string | null;
+  cli_version: string | null;
+}
+
+export interface CodexSessionListResponse {
+  installed: boolean;
+  status: CodexSessionListStatus;
+  sessions: CodexSessionRecord[];
+  next_cursor: string | null;
+  message: string;
+  error: string | null;
+}
+
+export type CodexSessionMessagesStatus = 'ready' | 'missing' | 'error' | string;
+
+export interface CodexSessionMessageRecord {
+  id: string;
+  role: 'user' | 'assistant' | 'error' | 'tool_call' | 'trace';
+  content: string;
+  timestamp: string;
+  tool_id?: string;
+  tool_name?: string;
+  args?: any;
+  result?: any;
+  is_error?: boolean;
+  result_pending?: boolean;
+  trace_type?: string;
+  trace_phase?: string;
+  trace_step?: number;
+  trace_summary?: string;
+  tool_category?: string;
+  tool_action?: string;
+  timeline_kind?: string;
+  risk_level?: string;
+}
+
+export interface CodexSessionMessagesResponse {
+  installed: boolean;
+  status: CodexSessionMessagesStatus;
+  thread_id: string;
+  messages: CodexSessionMessageRecord[];
+  message: string;
+  error: string | null;
+}
+
+export interface CodexConversationOpenRequest {
+  cwd?: string | null;
+  model?: string | null;
+  permission_mode?: 'read_only' | 'workspace_write' | 'full_access' | null;
+}
+
+export interface CodexConversationResumeRequest extends CodexConversationOpenRequest {
+  thread_id: string;
+}
+
+export interface CodexConversationOpenResponse {
+  installed: boolean;
+  status: 'ready' | 'missing' | 'error' | string;
+  session_key: string;
+  thread_id: string;
+  session_id: string | null;
+  title: string;
+  cwd: string | null;
+  instruction_hash: string;
+  instruction_bytes: number;
+  message: string;
+  error: string | null;
+}
+
+export interface CodexConversationTurnRequest {
+  message: string;
+  thread_id?: string | null;
+  cwd?: string | null;
+  model?: string | null;
+  reasoning_effort?: string | null;
+  speed?: string | null;
+  permission_mode?: 'read_only' | 'workspace_write' | 'full_access' | null;
+  plan_mode?: boolean;
+  goal_mode?: boolean;
+  goal_objective?: string | null;
+}
+
+export interface CodexConversationInterruptRequest {
+  thread_id?: string | null;
+  turn_id?: string | null;
+}
+
+export interface CodexConversationGoalClearRequest {
+  thread_id?: string | null;
+}
+
+export interface CodexConversationGoalClearResponse {
+  status: string;
+  thread_id: string | null;
+  cleared: boolean;
+}
+
+export interface CodexConversationTitleRequest {
+  thread_id: string;
+  message: string;
+  model?: string | null;
+  reasoning_effort?: string | null;
+  speed?: string | null;
+}
+
+export interface CodexConversationTitleResponse {
+  title: string;
+}
+
+export interface CodexUserInputAnswerPayload {
+  answers: string[];
+}
+
+export interface CodexRequestUserInputResponseRequest {
+  answers: Record<string, CodexUserInputAnswerPayload>;
 }
 
 export interface RuntimeInstanceHealth {
@@ -157,7 +368,7 @@ export interface UpdateRuntimeBudgetPayload {
   periodUnit: BudgetPeriodUnit;
 }
 
-export type RuntimeBudgetAgentName = 'OpenClaw' | 'Hermes' | 'Nanobot';
+export type RuntimeBudgetAgentName = 'Codex' | 'OpenClaw' | 'Hermes' | 'Nanobot';
 
 export interface StartSessionPayload {
   instance_id?: string;
@@ -171,7 +382,7 @@ export interface StartSessionResponse {
   session_key: string;
   status: string;
   instance_id: string;
-  platform: RuntimeInstance['platform'];
+  platform: RuntimeInstance['platform'] | 'codex';
   instance?: RuntimeInstance;
 }
 
@@ -346,6 +557,44 @@ export interface RuntimeSessionListResponse {
   total: number;
   page: number;
   page_size: number;
+}
+
+export interface LocalRuntimeSessionRecord {
+  platform: 'openclaw' | 'hermes';
+  instance_id: string;
+  source_session_id: string;
+  session_key: string;
+  title: string;
+  cwd: string | null;
+  created_at: string;
+  updated_at: string;
+  path_available: boolean;
+}
+
+export interface LocalRuntimeSessionListResponse {
+  platform: 'openclaw' | 'hermes';
+  instance_id: string;
+  sessions: LocalRuntimeSessionRecord[];
+  total: number;
+}
+
+export interface LocalRuntimeSessionDeleteResponse {
+  platform: 'openclaw' | 'hermes';
+  instance_id: string;
+  source_session_id: string;
+  session_key: string | null;
+  deleted_file: boolean;
+  updated_index: boolean;
+}
+
+export interface CodexSessionDeleteResponse {
+  thread_id: string;
+  source: string;
+  originator?: string | null;
+  history_kind?: 'cli' | 'xsafeclaw' | string | null;
+  archived: boolean;
+  deleted_file: boolean;
+  path: string | null;
 }
 
 // Sessions API
@@ -742,15 +991,6 @@ export interface GuardRuntimeObservation {
   risk_level?: string | null;
 }
 
-export type GuardToolPolicy = 'allow' | 'guard' | 'ask';
-export type GuardToolPolicyCategory = 'shell' | 'file_system' | 'browser' | 'network' | 'git';
-
-export type GuardToolPolicies = Record<GuardToolPolicyCategory, GuardToolPolicy>;
-
-export interface GuardToolPoliciesResponse {
-  policies: GuardToolPolicies;
-}
-
 // Guard API
 export const guardAPI = {
   pending: (resolved?: boolean) =>
@@ -766,10 +1006,6 @@ export const guardAPI = {
 
   getEnabled: () => api.get<{ enabled: boolean }>('/guard/enabled'),
   setEnabled: (enabled: boolean) => api.post<{ enabled: boolean }>('/guard/enabled', { enabled }),
-
-  toolPolicies: () => api.get<GuardToolPoliciesResponse>('/guard/tool-policies'),
-  setToolPolicies: (policies: Partial<GuardToolPolicies>) =>
-    api.put<GuardToolPoliciesResponse>('/guard/tool-policies', { policies }),
 };
 
 // System API (agent install / onboard / status)
@@ -793,6 +1029,104 @@ export const systemAPI = {
 
   /** Fast install/config probe used by setup and route guards. */
   installStatus: () => api.get<InstallStatusResponse>('/system/install-status', { timeout: 10000 }),
+
+  /** Read Codex CLI ChatGPT login state. */
+  getCodexAuthStatus: () =>
+    api.get<CodexAuthStatusResponse>('/system/codex/auth/status', { timeout: 10000 }),
+
+  /** Read Codex CLI runtime health from redacted CLI diagnostics. */
+  getCodexRuntimeStatus: (refresh?: boolean) =>
+    api.get<CodexRuntimeStatusResponse>(
+      '/system/codex/runtime',
+      { timeout: refresh ? 60000 : 35000, params: refresh ? { refresh: true } : undefined },
+    ),
+
+  /** Read Codex CLI ChatGPT rolling rate limits through app-server. */
+  getCodexRateLimits: () =>
+    api.get<CodexRateLimitsResponse>('/system/codex/rate-limits', { timeout: 15000 }),
+
+  /** Read the current Codex CLI model catalog through app-server. */
+  getCodexModels: () =>
+    api.get<CodexModelCatalogResponse>('/system/codex/models', { timeout: 15000 }),
+
+  /** Start the official Codex CLI login flow in the system browser. */
+  loginCodexAuth: () =>
+    api.post<CodexAuthStatusResponse>('/system/codex/auth/login', {}, { timeout: 0 }),
+
+  /** Clear Codex CLI authentication and return the refreshed state. */
+  logoutCodexAuth: () =>
+    api.post<CodexAuthStatusResponse>('/system/codex/auth/logout', {}, { timeout: 60000 }),
+
+  /** List local Codex CLI session summaries through app-server. */
+  listCodexSessions: (params?: { limit?: number; cursor?: string }) =>
+    api.get<CodexSessionListResponse>('/system/codex/sessions', { timeout: 15000, params }),
+
+  /** List local OpenClaw/Hermes sessions directly from runtime history files. */
+  listRuntimeSessions: (params: { platform: 'openclaw' | 'hermes'; instance_id?: string; limit?: number }) =>
+    api.get<LocalRuntimeSessionListResponse>('/system/runtime-sessions', { timeout: 15000, params }),
+
+  /** Delete one local OpenClaw/Hermes runtime history file. */
+  deleteRuntimeSession: (
+    platform: 'openclaw' | 'hermes',
+    sourceSessionId: string,
+    params?: { instance_id?: string },
+  ) =>
+    api.delete<LocalRuntimeSessionDeleteResponse>(
+      `/system/runtime-sessions/${encodeURIComponent(platform)}/${encodeURIComponent(sourceSessionId)}`,
+      { timeout: 15000, params },
+    ),
+
+  /** Archive and delete one local Codex history rollout managed by CLI or XSafeClaw. */
+  deleteCodexSession: (threadId: string) =>
+    api.delete<CodexSessionDeleteResponse>(`/system/codex/sessions/${encodeURIComponent(threadId)}`, { timeout: 15000 }),
+
+  /** Read a Codex CLI thread transcript summary through app-server. */
+  getCodexSessionMessages: (threadId: string) =>
+    api.get<CodexSessionMessagesResponse>(`/system/codex/sessions/${encodeURIComponent(threadId)}/messages`, { timeout: 15000 }),
+
+  /** Start a Codex app-server thread with XSafeClaw developer instructions. */
+  startCodexConversation: (payload: CodexConversationOpenRequest) =>
+    api.post<CodexConversationOpenResponse>('/system/codex/conversations/start', payload, { timeout: 20000 }),
+
+  /** Resume a Codex app-server thread with XSafeClaw developer instructions. */
+  resumeCodexConversation: (payload: CodexConversationResumeRequest) =>
+    api.post<CodexConversationOpenResponse>('/system/codex/conversations/resume', payload, { timeout: 20000 }),
+
+  /** Generate and persist a short Codex thread title using an ephemeral app-server thread. */
+  generateCodexSessionTitle: (sessionKey: string, payload: CodexConversationTitleRequest) =>
+    api.post<CodexConversationTitleResponse>(
+      `/system/codex/conversations/${encodeURIComponent(sessionKey)}/title/generate`,
+      payload,
+      { timeout: 60000 },
+    ),
+
+  /** Interrupt the active Codex app-server turn for a conversation. */
+  interruptCodexConversation: (sessionKey: string, payload?: CodexConversationInterruptRequest) =>
+    api.post<{ status: string; interrupted: boolean }>(
+      `/system/codex/conversations/${encodeURIComponent(sessionKey)}/interrupt`,
+      payload ?? {},
+      { timeout: 10000 },
+    ),
+
+  /** Respond to an active Codex app-server user-input request. */
+  respondCodexUserInputRequest: (
+    sessionKey: string,
+    requestId: string,
+    payload: CodexRequestUserInputResponseRequest,
+  ) =>
+    api.post<{ status: string; request_id: string }>(
+      `/system/codex/conversations/${encodeURIComponent(sessionKey)}/requests/${encodeURIComponent(requestId)}/respond`,
+      payload,
+      { timeout: 10000 },
+    ),
+
+  /** Clear an active Codex app-server goal for a conversation. */
+  clearCodexGoal: (sessionKey: string, payload?: CodexConversationGoalClearRequest) =>
+    api.post<CodexConversationGoalClearResponse>(
+      `/system/codex/conversations/${encodeURIComponent(sessionKey)}/goal/clear`,
+      payload ?? {},
+      { timeout: 10000 },
+    ),
 
   instances: () =>
     api.get<{ instances: RuntimeInstance[]; total: number }>('/system/instances'),
@@ -839,6 +1173,9 @@ export const systemAPI = {
 
   /** SSE URL for nanobot install stream (use with fetch). */
   nanobotInstallUrl: () => '/api/system/nanobot/install',
+
+  /** SSE URL for official Codex CLI install stream (use with fetch). */
+  codexInstallUrl: () => '/api/system/codex/install',
 
   /** Create a skeleton nanobot config/workspace for compatibility flows. */
   nanobotInitDefault: () =>

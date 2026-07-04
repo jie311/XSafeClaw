@@ -7,13 +7,13 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   CheckCircle, Download, Loader2, XCircle, ChevronRight, Terminal,
-  ArrowDownToLine, Zap, Bot, Code2, Settings2, MapPin, Activity,
+  ArrowDownToLine, Zap, Bot, Code2, Settings2, MapPin, Activity, Sparkles,
 } from 'lucide-react';
 import { systemAPI } from '../services/api';
 import { useI18n } from '../i18n';
 
-type Stage = 'checking' | 'selecting' | 'downloading_node' | 'installing_openclaw' | 'installing_nanobot' | 'installing_hermes' | 'install_failed' | 'install_hermes_failed';
-type Platform = 'openclaw' | 'nanobot' | 'hermes';
+type Stage = 'checking' | 'selecting' | 'downloading_node' | 'installing_openclaw' | 'installing_nanobot' | 'installing_hermes' | 'installing_codex' | 'install_failed' | 'install_hermes_failed';
+type Platform = 'openclaw' | 'nanobot' | 'hermes' | 'codex';
 type HostOs = 'windows' | 'macos' | 'linux';
 
 interface PlatformInfo {
@@ -71,7 +71,15 @@ function StepBar({ active, steps }: { active: number; steps: { id: number; label
 
 function TerminalLog({ lines, waitingText }: { lines: LogLine[]; waitingText?: string }) {
   const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => { ref.current?.scrollTo({ top: ref.current.scrollHeight, behavior: 'smooth' }); }, [lines]);
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    if (typeof node.scrollTo === 'function') {
+      node.scrollTo({ top: node.scrollHeight, behavior: 'smooth' });
+    } else {
+      node.scrollTop = node.scrollHeight;
+    }
+  }, [lines]);
   return (
     <div ref={ref} className="bg-[#0d0d0d] border border-border rounded-xl p-4 font-mono text-[12px] leading-5 h-40 overflow-y-auto space-y-0.5">
       {lines.length === 0 && <span className="text-text-muted">{waitingText}</span>}
@@ -124,13 +132,14 @@ interface SetupCardProps {
 function SetupCard({ platform, info, installing, onInstall, onConfigure, t }: SetupCardProps) {
   const isOpenClaw = platform === 'openclaw';
   const isHermes = platform === 'hermes';
-  const name = isOpenClaw ? 'OpenClaw' : isHermes ? 'Hermes Agent' : 'Nanobot';
-  const Icon = isOpenClaw ? Zap : isHermes ? Code2 : Bot;
+  const isCodex = platform === 'codex';
+  const name = isOpenClaw ? 'OpenClaw' : isHermes ? 'Hermes Agent' : isCodex ? (t.setup.codexName || 'Codex CLI') : 'Nanobot';
+  const Icon = isOpenClaw ? Zap : isHermes ? Code2 : isCodex ? Sparkles : Bot;
   const isInstalled = info.installed === true;
   const isUnknown = info.installed === null;
-  const accentColor = isOpenClaw ? 'border-blue-500/30 bg-blue-500/5' : isHermes ? 'border-violet-500/30 bg-violet-500/5' : 'border-cyan-500/30 bg-cyan-500/5';
-  const iconBg = isOpenClaw ? 'bg-blue-500/15 text-blue-400' : isHermes ? 'bg-violet-500/15 text-violet-400' : 'bg-cyan-500/15 text-cyan-400';
-  const badgeInstalled = isOpenClaw ? 'bg-blue-500/15 text-blue-400' : isHermes ? 'bg-violet-500/15 text-violet-400' : 'bg-cyan-500/15 text-cyan-400';
+  const accentColor = isOpenClaw ? 'border-blue-500/30 bg-blue-500/5' : isHermes ? 'border-violet-500/30 bg-violet-500/5' : isCodex ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-cyan-500/30 bg-cyan-500/5';
+  const iconBg = isOpenClaw ? 'bg-blue-500/15 text-blue-400' : isHermes ? 'bg-violet-500/15 text-violet-400' : isCodex ? 'bg-emerald-500/15 text-emerald-300' : 'bg-cyan-500/15 text-cyan-400';
+  const badgeInstalled = isOpenClaw ? 'bg-blue-500/15 text-blue-400' : isHermes ? 'bg-violet-500/15 text-violet-400' : isCodex ? 'bg-emerald-500/15 text-emerald-300' : 'bg-cyan-500/15 text-cyan-400';
   const badgeNotInstalled = 'bg-surface-2 text-text-muted';
 
   // §50 — installed cards become a single big click target that opens the
@@ -188,7 +197,9 @@ function SetupCard({ platform, info, installing, onInstall, onConfigure, t }: Se
               ? t.setup.openclawDesc
               : isHermes
                 ? (t.setup as any).hermesDesc
-                : t.setup.nanobotDesc}
+                : isCodex
+                  ? (t.setup.codexDesc || 'OpenAI Codex command-line agent runtime.')
+                  : t.setup.nanobotDesc}
           </p>
           {isInstalled && info.version && (
             <p className="text-[11px] text-text-muted mt-1 font-mono">
@@ -206,11 +217,13 @@ function SetupCard({ platform, info, installing, onInstall, onConfigure, t }: Se
               ? 'bg-blue-500 hover:bg-blue-600 text-white shadow-blue-500/25'
               : isHermes
                 ? 'bg-violet-600 hover:bg-violet-500 text-white shadow-violet-600/25'
+                : isCodex
+                  ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-600/25'
                 : 'bg-cyan-500 hover:bg-cyan-600 text-white shadow-cyan-500/25'
           }`}
         >
           <Download className="w-4 h-4" />
-          {isOpenClaw ? t.setup.installOpenClaw : isHermes ? ((t.setup as any).hermesGuideTitle || 'Install Hermes Agent') : t.setup.installNanobot}
+          {isOpenClaw ? t.setup.installOpenClaw : isHermes ? ((t.setup as any).hermesGuideTitle || 'Install Hermes Agent') : isCodex ? (t.setup.installCodex || 'Install Codex') : t.setup.installNanobot}
           <ChevronRight className="w-4 h-4" />
         </button>
       )}
@@ -266,7 +279,13 @@ function SetupCard({ platform, info, installing, onInstall, onConfigure, t }: Se
       {installing && (
         <div className="mt-4 flex items-center gap-2 text-[12px] text-text-muted">
           <Loader2 className="w-4 h-4 animate-spin" />
-          {isOpenClaw ? t.setup.installing : isHermes ? ((t.setup as any).hermesInstalling || 'Installing Hermes Agent...') : t.setup.nanobotInstalling}
+          {isOpenClaw
+            ? t.setup.installing
+            : isHermes
+              ? ((t.setup as any).hermesInstalling || 'Installing Hermes Agent...')
+              : isCodex
+                ? (t.setup.codexInstalling || 'Installing Codex CLI...')
+                : t.setup.nanobotInstalling}
         </div>
       )}
     </div>
@@ -276,6 +295,7 @@ function SetupCard({ platform, info, installing, onInstall, onConfigure, t }: Se
 export default function Setup() {
   const navigate = useNavigate();
   const { t } = useI18n();
+  const setupText = t.setup as any;
   const hostOs = detectClientOs();
   const manualNanobot = nanobotManualSteps(hostOs);
   const [stage, setStage] = useState<Stage>('checking');
@@ -284,6 +304,7 @@ export default function Setup() {
   const [openclawInfo, setOpenclawInfo] = useState<PlatformInfo>({ installed: null });
   const [nanobotInfo, setNanobotInfo] = useState<PlatformInfo>({ installed: null, configured: false });
   const [hermesInfo, setHermesInfo] = useState<PlatformInfo>({ installed: null, configured: false });
+  const [codexInfo, setCodexInfo] = useState<PlatformInfo>({ installed: null, configured: false });
   const [installingPlatform, setInstallingPlatform] = useState<Platform | null>(null);
   const [detectionError, setDetectionError] = useState('');
   const abortRef = useRef<AbortController | null>(null);
@@ -302,6 +323,7 @@ export default function Setup() {
       const openclawOk = Boolean(d.openclaw_installed);
       const nanobotOk = Boolean(d.nanobot_installed);
       const hermesOk = Boolean(d.hermes_installed);
+      const codexOk = Boolean(d.codex_installed);
 
       setOpenclawInfo({
         installed: openclawOk,
@@ -318,10 +340,16 @@ export default function Setup() {
         version: d.hermes_version || undefined,
         configured: hermesOk && Boolean(d.config_exists),
       });
+      setCodexInfo({
+        installed: codexOk,
+        version: d.codex_version || undefined,
+        configured: codexOk && Boolean(d.codex_configured),
+      });
     } catch {
       setOpenclawInfo({ installed: null });
       setNanobotInfo({ installed: null, configured: false });
       setHermesInfo({ installed: null, configured: false });
+      setCodexInfo({ installed: null, configured: false });
       setDetectionError(t.setup.detectFailed || 'Runtime detection failed. Check the backend and retry.');
     } finally {
       setStage('selecting');
@@ -402,67 +430,6 @@ export default function Setup() {
     }
   };
 
-  // Nanobot install (SSE flow only; config is created later in /nanobot_configure)
-  const handleInstallNanobot = async () => {
-    setInstallingPlatform('nanobot');
-    setStage('installing_nanobot');
-    setLogs([]);
-    addLog(t.setup.nanobotInitStart, 'info');
-
-    try {
-      const resp = await fetch('/api/system/nanobot/install', { method: 'POST' });
-      if (!resp.ok || !resp.body) {
-        addLog(`HTTP ${resp.status} ${resp.statusText}`, 'error');
-        addLog(t.setup.nanobotInstallFailedHint, 'info');
-        setStage('install_failed');
-        return;
-      }
-      const reader = resp.body!.getReader();
-      const dec = new TextDecoder();
-      let buf = '';
-      let success = false;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const parts = buf.split('\n\n');
-        buf = parts.pop() ?? '';
-        for (const part of parts) {
-          const line = part.trim();
-          if (!line.startsWith('data:')) continue;
-          try {
-            const d = JSON.parse(line.slice(5).trim());
-            if (d.type === 'output' && d.text) addLog(d.text);
-            else if (d.type === 'done') {
-              success = d.success;
-              if (success) addLog(t.setup.nanobotInitSuccess, 'success');
-              else addLog(`uv exited with code ${d.exit_code}`, 'error');
-            } else if (d.type === 'error') {
-              addLog(d.message, 'error');
-              success = false;
-            }
-          } catch {}
-        }
-      }
-
-      if (success) {
-        addLog(t.setup.nanobotCliInstallComplete || t.setup.nanobotInitSuccess, 'success');
-        setNanobotInfo(prev => ({ ...prev, installed: true, configured: false }));
-        setTimeout(() => navigate('/nanobot_configure', { replace: true }), 1200);
-      } else {
-        // Show manual install hint
-        addLog(t.setup.nanobotInstallFailedHint, 'info');
-        setStage('install_failed');
-      }
-    } catch (err: any) {
-      addLog(String(err), 'error');
-      setStage('install_failed');
-    } finally {
-      setInstallingPlatform(null);
-    }
-  };
-
   const handleInstallHermes = async () => {
     setInstallingPlatform('hermes');
     setStage('installing_hermes');
@@ -514,6 +481,68 @@ export default function Setup() {
         addLog(String(err), 'error');
         setStage('install_hermes_failed');
       }
+    } finally {
+      setInstallingPlatform(null);
+    }
+  };
+
+  const handleInstallCodex = async () => {
+    setInstallingPlatform('codex');
+    setStage('installing_codex');
+    setLogs([]);
+    addLog(setupText.codexInstallStart || 'Installing Codex CLI with the official installer.', 'info');
+
+    try {
+      const resp = await fetch(systemAPI.codexInstallUrl(), { method: 'POST' });
+      if (!resp.ok || !resp.body) {
+        addLog(`HTTP ${resp.status} ${resp.statusText}`, 'error');
+        setStage('install_failed');
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      let success = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const parts = buf.split('\n\n');
+        buf = parts.pop() ?? '';
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith('data:')) continue;
+          try {
+            const d = JSON.parse(line.slice(5).trim());
+            if (d.type === 'output' && d.text) {
+              addLog(d.text);
+            } else if (d.type === 'done') {
+              success = Boolean(d.success);
+              if (success) {
+                addLog(setupText.codexInstallComplete || 'Codex CLI installation complete.', 'success');
+                setCodexInfo(prev => ({ ...prev, installed: true, version: d.version || prev.version, configured: false }));
+              } else {
+                const detail = d.detail || d.message || (d.exit_code !== undefined ? `Install exited with code ${d.exit_code}` : 'Codex CLI installation failed.');
+                addLog(String(detail), 'error');
+              }
+            } else if (d.type === 'error') {
+              addLog(d.message || 'Codex CLI installation failed.', 'error');
+              success = false;
+            }
+          } catch {}
+        }
+      }
+
+      if (success) {
+        setTimeout(() => navigate('/codex_configure', { replace: true }), 1200);
+      } else {
+        setStage('install_failed');
+      }
+    } catch (err: any) {
+      addLog(String(err), 'error');
+      setStage('install_failed');
     } finally {
       setInstallingPlatform(null);
     }
@@ -577,19 +606,19 @@ export default function Setup() {
               )}
 
               <SetupCard
+                platform="codex"
+                info={codexInfo}
+                installing={installingPlatform === 'codex'}
+                onInstall={handleInstallCodex}
+                onConfigure={() => navigate('/codex_configure', { replace: true })}
+                t={t}
+              />
+              <SetupCard
                 platform="openclaw"
                 info={openclawInfo}
                 installing={installingPlatform === 'openclaw'}
                 onInstall={handleInstallOpenClaw}
                 onConfigure={() => navigate('/openclaw_configure', { replace: true })}
-                t={t}
-              />
-              <SetupCard
-                platform="nanobot"
-                info={nanobotInfo}
-                installing={installingPlatform === 'nanobot'}
-                onInstall={handleInstallNanobot}
-                onConfigure={() => navigate('/nanobot_configure', { replace: true })}
                 t={t}
               />
               <SetupCard
@@ -632,6 +661,8 @@ export default function Setup() {
                     <p className="text-text-secondary mt-1 leading-5 not-italic font-sans">{t.setup.nanobotOfficialFlowHint}</p>
                     <p className="text-text-secondary mt-2"><span className="text-text-muted select-none"># </span><span className="text-sky-400">{(t.setup as any).commentHermes}</span></p>
                     <p className="text-blue-400 select-all break-all">curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash</p>
+                    <p className="text-text-secondary mt-2"><span className="text-text-muted select-none"># </span><span className="text-sky-400">{setupText.commentCodex || 'Codex CLI'}</span></p>
+                    <p className="text-blue-400 select-all break-all">{hostOs === 'windows' ? 'powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://chatgpt.com/codex/install.ps1 | iex"' : 'curl -fsSL https://chatgpt.com/codex/install.sh | sh'}</p>
                   </div>
                 </div>
               )}
@@ -756,6 +787,20 @@ export default function Setup() {
                 <div>
                   <p className="text-sm font-semibold text-text-primary">{(t.setup as any).hermesInstalling}</p>
                   <p className="text-[12px] text-text-muted">{(t.setup as any).hermesInstallingDesc}</p>
+                </div>
+              </div>
+              <TerminalLog lines={logs} waitingText={t.setup.waiting} />
+            </div>
+          )}
+
+          {/* Installing Codex CLI */}
+          {stage === 'installing_codex' && (
+            <div className="flex flex-col gap-4">
+              <div className="flex items-center gap-3">
+                <Loader2 className="w-5 h-5 text-emerald-300 animate-spin flex-shrink-0" />
+                <div>
+                  <p className="text-sm font-semibold text-text-primary">{setupText.codexInstalling || 'Installing Codex CLI...'}</p>
+                  <p className="text-[12px] text-text-muted">{setupText.codexInstallingDesc || 'Using the official installer for this operating system.'}</p>
                 </div>
               </div>
               <TerminalLog lines={logs} waitingText={t.setup.waiting} />

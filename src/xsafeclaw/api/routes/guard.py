@@ -258,6 +258,7 @@ class RuntimeToolCheckRequest(BaseModel):
     tool_name: str
     params: dict = {}
     messages: list[dict[str, Any]] = []
+    force_approval: bool = False
 
 
 @router.post("/runtime-tool-check", response_model=ToolCheckResponse)
@@ -271,6 +272,7 @@ async def runtime_tool_check(body: RuntimeToolCheckRequest):
         tool_name=body.tool_name,
         params=body.params,
         messages=body.messages,
+        force_approval=body.force_approval,
     )
     return ToolCheckResponse(**result)
 
@@ -370,48 +372,6 @@ async def cleanup_pending():
     """Remove old resolved pending items."""
     removed = guard_service.cleanup_resolved()
     return {"removed": removed}
-
-
-class ToolPoliciesResponse(BaseModel):
-    policies: dict[str, str]
-
-
-class ToolPoliciesRequest(BaseModel):
-    policies: dict[str, str]
-
-
-def _validate_tool_policies(policies: dict[str, str]) -> None:
-    categories = set(guard_service.TOOL_POLICY_CATEGORIES)
-    values = set(guard_service.TOOL_POLICY_VALUES)
-    invalid_categories = sorted(set(policies) - categories)
-    invalid_values = {
-        category: value
-        for category, value in policies.items()
-        if category in categories and str(value).strip().lower() not in values
-    }
-    if invalid_categories or invalid_values:
-        raise HTTPException(
-            422,
-            {
-                "invalid_categories": invalid_categories,
-                "invalid_values": invalid_values,
-                "allowed_categories": sorted(categories),
-                "allowed_values": sorted(values),
-            },
-        )
-
-
-@router.get("/tool-policies", response_model=ToolPoliciesResponse)
-async def get_tool_policies():
-    """Return persisted RuntimeGuard tool policy settings."""
-    return ToolPoliciesResponse(policies=guard_service.load_tool_policies())
-
-
-@router.put("/tool-policies", response_model=ToolPoliciesResponse)
-async def set_tool_policies(body: ToolPoliciesRequest):
-    """Persist RuntimeGuard tool policy settings."""
-    _validate_tool_policies(body.policies)
-    return ToolPoliciesResponse(policies=guard_service.save_tool_policies(body.policies))
 
 
 @router.get("/enabled")

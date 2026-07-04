@@ -8,7 +8,7 @@ import {
   useState,
   useSyncExternalStore,
 } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { v4 as uuidv4 } from 'uuid';
 import {
   type LucideIcon,
@@ -20,6 +20,8 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  CircleQuestionMark,
+  ClipboardList,
   Cpu,
   FolderOpen,
   GitBranch,
@@ -27,9 +29,11 @@ import {
   Loader2,
   Lock,
   Network,
+  Plus,
   Route,
   Send,
   Shield,
+  Target,
   Terminal,
   Trash2,
   User,
@@ -38,19 +42,26 @@ import {
   Zap,
 } from 'lucide-react';
 import {
+  assetsAPI,
   budgetAPI,
   chatAPI,
   guardAPI,
-  sessionsAPI,
   systemAPI,
   type BudgetPeriodUnit,
+  type DirectoryBrowseEntry,
   type GuardPendingApproval,
   type GuardRuntimeObservation,
   type RuntimeBudgetPlatform,
   type RuntimeBudgetStatus,
   type RuntimeInstance,
   type StartSessionResponse,
+  type LocalRuntimeSessionRecord,
   type RuntimeSessionRecord,
+  type CodexSessionRecord,
+  type CodexModelCatalogItem,
+  type CodexRateLimitWindow,
+  type CodexRateLimitsResponse,
+  type CodexRequestUserInputResponseRequest,
 } from '../services/api';
 import MarkdownMessage from '../components/MarkdownMessage';
 import { useRuntimeInstances } from '../hooks/useAPI';
@@ -74,26 +85,45 @@ import {
 import {
   buildGuardStatusRows,
   calculateGuardStatusSummary,
-  defaultToolPermissions,
-  toolPermissionsFromPolicies,
-  toolPoliciesFromPermissions,
   type GuardStatusRowTone,
-  type RuntimeGuardToolId,
-  type RuntimeGuardToolPermission,
-  type RuntimeGuardToolPermissions,
 } from './runtimeGuardToolPolicy';
+import { loadCodexConfig, type CodexLocalConfig, type CodexPermissionMode } from './CodexConfigure';
+import {
+  catalogModelsOrFallback,
+  CODEX_STANDARD_SPEED_ID,
+  codexModelDisplayName,
+  codexReasoningOptionsForModel,
+  codexSpeedOptionsForModel,
+  codexSpeedServiceTier,
+  FALLBACK_CODEX_MODEL_CATALOG,
+  findCodexModel,
+  normalizeCodexSelection,
+  shortCodexModelDisplay,
+  type CodexModelOption,
+  type CodexReasoningLevel,
+  type CodexSpeedOption,
+} from './codexModelCatalog';
 import './RuntimeGuardConsole.css';
 
-export type AgentName = 'OpenClaw' | 'Hermes' | 'Nanobot';
+export type AgentName = 'OpenClaw' | 'Hermes' | 'Nanobot' | 'Codex';
+type RuntimeAgentName = Exclude<AgentName, 'Codex'>;
 type RuntimePlatform = RuntimeInstance['platform'];
+type RuntimeGuardSessionPlatform = RuntimePlatform | 'codex';
 type RuntimeBudgetStatusMap = Record<RuntimeBudgetPlatform, RuntimeBudgetStatus>;
 type GuardMode = 'Off' | 'On';
 type AgentStatus = 'Running' | 'Idle' | 'Not installed';
+type CodexComposerMenu = 'options' | 'model' | 'permission' | null;
+type CodexSubmenu = 'model' | 'speed' | null;
+type CodexRateLimitsState = {
+  data: CodexRateLimitsResponse | null;
+  loading: boolean;
+  error: string | null;
+};
 export type RuntimeGuardSession = {
   sessionKey: string;
   historySessionId?: string;
   agent: AgentName;
-  platform: RuntimePlatform;
+  platform: RuntimeGuardSessionPlatform;
   instanceId: string;
   displayName?: string;
   workspacePath?: string;
@@ -102,6 +132,23 @@ export type RuntimeGuardSession = {
   lastActivityAt?: string;
   status: 'ready' | 'error';
   autoTitlePending?: boolean;
+  codexTitleState?: 'temporary' | 'generated_pending' | 'generated_applied';
+  codexTitleSourceMessage?: string;
+  frontendOnly?: boolean;
+  codexHistory?: boolean;
+  codexHistoryKind?: string | null;
+  codexOriginator?: string | null;
+  codexDeletable?: boolean;
+  codexModel?: CodexModelOption;
+  codexReasoningLevel?: CodexReasoningLevel;
+  codexSpeed?: CodexSpeedOption;
+  codexPermissionMode?: CodexPermissionMode;
+};
+type PendingCodexNewTask = {
+  requestText: string;
+  seed?: Partial<StartSessionResponse>;
+  config: CodexLocalConfig;
+  workspaceDir: string;
 };
 type InstallMap = Record<AgentName, boolean | null>;
 type AgentDisplay = {
@@ -109,14 +156,16 @@ type AgentDisplay = {
   status: AgentStatus;
   className: string;
   installed: boolean;
+  runtimeBacked: boolean;
 };
-type RuntimeGuardModal = 'tools' | 'sessions' | 'approvals' | 'blocked' | null;
+type RuntimeGuardModal = 'sessions' | 'approvals' | 'blocked' | null;
 type SessionHistoryAgentFilter = 'All' | AgentName;
 export type BlockedModalRange = '24h' | '7d' | 'all';
 
 const RUNTIME_GUARD_SESSIONS_KEY = 'xsafeclaw:runtime-guard:sessions';
 const RUNTIME_GUARD_DRAFTS_KEY = 'xsafeclaw:runtime-guard:drafts';
 const APPROVAL_POLL_INTERVAL_MS = 3000;
+const CODEX_QUOTA_REFRESH_INTERVAL_MS = 60_000;
 const BUILD_TIME_XSAFECLAW_VERSION = import.meta.env.VITE_XSAFECLAW_VERSION || null;
 const RUNTIME_GUARD_DESIGN_HEIGHT = 570;
 const RUNTIME_GUARD_LEFT_WIDTH = 156;
@@ -127,7 +176,7 @@ const RUNTIME_GUARD_MIN_DESIGN_WIDTH = RUNTIME_GUARD_LEFT_WIDTH + RUNTIME_GUARD_
 const RUNTIME_GUARD_RIGHT_EDGE_GUARD = 2;
 
 const agentDefinitions: Array<{
-  name: AgentName;
+  name: RuntimeAgentName;
   platform: RuntimeBudgetPlatform;
   className: string;
 }> = [
@@ -136,8 +185,52 @@ const agentDefinitions: Array<{
   { name: 'Nanobot', platform: 'nanobot', className: 'agent-nanobot' },
 ];
 
-const sessionHistoryFilters: SessionHistoryAgentFilter[] = ['All', 'OpenClaw', 'Hermes', 'Nanobot'];
+const sidebarAgentDefinitions: Array<{
+  name: AgentName;
+  platform?: RuntimeBudgetPlatform;
+  className: string;
+  runtimeBacked: boolean;
+}> = [
+  { name: 'Codex', className: 'agent-codex', runtimeBacked: false },
+  ...agentDefinitions
+    .filter(agent => agent.name !== 'Nanobot')
+    .map(agent => ({ ...agent, runtimeBacked: true })),
+];
+
+const RUNTIME_GUARD_SIDEBAR_LAYOUT = {
+  agentsTop: 94,
+  agentsHeight: 162,
+  agentRowsTop: 18,
+  agentRowGap: 36,
+  agentRowHeight: 34,
+  historyTop: 239,
+  historyHeight: 186,
+  budgetTop: 446,
+  budgetHeight: 92,
+  taskPanelTopBase: 50,
+  taskPanelHeightBase: 488,
+} as const;
+
+export function runtimeGuardSidebarLayoutMetrics() {
+  const agentsVisibleBottom = RUNTIME_GUARD_SIDEBAR_LAYOUT.agentsTop
+    + RUNTIME_GUARD_SIDEBAR_LAYOUT.agentRowsTop
+    + (sidebarAgentDefinitions.length - 1) * RUNTIME_GUARD_SIDEBAR_LAYOUT.agentRowGap
+    + RUNTIME_GUARD_SIDEBAR_LAYOUT.agentRowHeight;
+  const historyVisibleBottom = RUNTIME_GUARD_SIDEBAR_LAYOUT.historyTop
+    + RUNTIME_GUARD_SIDEBAR_LAYOUT.historyHeight;
+  return {
+    budgetBottom: RUNTIME_GUARD_SIDEBAR_LAYOUT.budgetTop + RUNTIME_GUARD_SIDEBAR_LAYOUT.budgetHeight,
+    middleSessionPanelBottom: RUNTIME_GUARD_SIDEBAR_LAYOUT.taskPanelTopBase + RUNTIME_GUARD_SIDEBAR_LAYOUT.taskPanelHeightBase,
+    visibleGaps: [
+      RUNTIME_GUARD_SIDEBAR_LAYOUT.historyTop - agentsVisibleBottom,
+      RUNTIME_GUARD_SIDEBAR_LAYOUT.budgetTop - historyVisibleBottom,
+    ],
+  };
+}
+
+const sessionHistoryFilters: SessionHistoryAgentFilter[] = ['All', 'OpenClaw', 'Hermes', 'Nanobot', 'Codex'];
 const runtimeBudgetPlatforms: RuntimeBudgetPlatform[] = ['openclaw', 'hermes', 'nanobot'];
+const codexPermissionOptions: CodexPermissionMode[] = ['read_only', 'workspace_write', 'full_access'];
 const DEFAULT_BUDGET_PERIOD_MS = 24 * 60 * 60 * 1000;
 
 function defaultRuntimeBudgetStatus(platform: RuntimeBudgetPlatform, now = Date.now()): RuntimeBudgetStatus {
@@ -187,7 +280,6 @@ function runtimeBudgetRemainingMs(status: RuntimeBudgetStatus, now = Date.now())
   return Math.max(0, Number(status.remainingMs) || 0);
 }
 
-const toolPermissionOptions: RuntimeGuardToolPermission[] = ['Allowed', 'Guard', 'Asked'];
 type RuntimeGuardCopy = ReturnType<typeof useI18n>['t']['runtimeGuard'];
 
 function rgText(template: string, values: Record<string, string | number> = {}): string {
@@ -197,14 +289,50 @@ function rgText(template: string, values: Record<string, string | number> = {}):
   );
 }
 
-function toolDisplayName(toolId: RuntimeGuardToolId, copy: RuntimeGuardCopy): string {
-  return copy.toolsModal.toolNames[toolId];
+function formatCodexQuotaPercent(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '--%';
+  return `${Math.round(Math.max(0, Math.min(100, value)))}%`;
 }
 
-function permissionDisplayLabel(permission: RuntimeGuardToolPermission, copy: RuntimeGuardCopy): string {
-  if (permission === 'Allowed') return copy.toolsModal.permissions.allow;
-  if (permission === 'Asked') return copy.toolsModal.permissions.ask;
-  return copy.toolsModal.permissions.guard;
+function codexLocale(locale: string): string {
+  return locale === 'zh' ? 'zh-CN' : 'en-US';
+}
+
+function formatCodexClockTime(resetsAt: number, locale: string): string {
+  return new Intl.DateTimeFormat(codexLocale(locale), {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(resetsAt * 1000)).replace(/^24:/, '00:');
+}
+
+function formatCodexCalendarDate(resetsAt: number, locale: string): string {
+  return new Intl.DateTimeFormat(codexLocale(locale), {
+    month: locale === 'zh' ? 'long' : 'short',
+    day: 'numeric',
+  }).format(new Date(resetsAt * 1000));
+}
+
+function formatCodexQuotaRefresh(
+  window: CodexRateLimitWindow | null | undefined,
+  kind: 'fiveHour' | 'sevenDay',
+  state: CodexRateLimitsState,
+  copy: RuntimeGuardCopy,
+  locale: string,
+): string {
+  if (state.loading && !state.data) return copy.sidebar.codexQuotaRefreshing;
+  if (state.data?.status === 'logged_out') return copy.sidebar.codexQuotaLoggedOut;
+  if (state.error || !state.data || state.data.status !== 'ready') return copy.sidebar.codexQuotaUnavailable;
+  const resetsAt = window?.resets_at;
+  if (typeof resetsAt !== 'number' || !Number.isFinite(resetsAt)) return copy.sidebar.codexQuotaUnavailable;
+  if (kind === 'fiveHour') {
+    return rgText(copy.sidebar.codexQuotaFiveHourReset, {
+      time: formatCodexClockTime(resetsAt, locale),
+    });
+  }
+  return rgText(copy.sidebar.codexQuotaWeekReset, {
+    date: formatCodexCalendarDate(resetsAt, locale),
+  });
 }
 
 function agentStatusDisplay(status: AgentStatus, copy: RuntimeGuardCopy): string {
@@ -247,15 +375,7 @@ function guardStatusRowStatus(status: string, copy: RuntimeGuardCopy): string {
   if (status === 'Clear') return copy.guardStatus.clear;
   const waiting = status.match(/^(\d+) waiting$/);
   if (waiting) return rgText(copy.guardStatus.waiting, { count: waiting[1] });
-  return status
-    .split('/')
-    .map(part => {
-      if (part === 'Allow') return copy.toolsModal.permissions.allow;
-      if (part === 'Ask') return copy.toolsModal.permissions.ask;
-      if (part === 'Guard') return copy.toolsModal.permissions.guard;
-      return part;
-    })
-    .join('/');
+  return status;
 }
 
 function guardScoreTone(score: number): 'green' | 'orange' | 'red' {
@@ -272,18 +392,6 @@ function guardScoreRingDegrees(score: number): number {
   const scoreRatio = (clampedScore - GUARD_SCORE_RING_BASE_SCORE) / (100 - GUARD_SCORE_RING_BASE_SCORE);
   return GUARD_SCORE_RING_BASE_DEGREES + scoreRatio * (360 - GUARD_SCORE_RING_BASE_DEGREES);
 }
-
-const configurableTools: Array<{
-  id: RuntimeGuardToolId;
-  icon: LucideIcon;
-  name: string;
-}> = [
-  { id: 'shell', icon: Terminal, name: 'Shell' },
-  { id: 'fileSystem', icon: FolderOpen, name: 'File System' },
-  { id: 'browser', icon: Globe2, name: 'Browser' },
-  { id: 'network', icon: Network, name: 'Network' },
-  { id: 'git', icon: GitBranch, name: 'Git' },
-];
 
 const traceTypes = new Set([
   'trace_start',
@@ -440,6 +548,9 @@ export type RuntimeTimelineKind =
   | 'tool_git'
   | 'tool_mcp'
   | 'tool_unknown'
+  | 'codex_user_input'
+  | 'codex_plan'
+  | 'codex_goal'
   | 'approval_request'
   | 'approval_allowed'
   | 'approval_denied'
@@ -614,6 +725,9 @@ export function getTimelineAppearance(
   }
   if (row.role === 'user') return { kind: 'user_message', tone: 'blue', title: copy?.main.you ?? 'You', Icon: User };
   if (row.role === 'assistant') return { kind: 'assistant_final', tone: 'green', title: copy?.main.assistant ?? 'Assistant', Icon: Bot };
+  if (row.role === 'codex_question') return { kind: 'codex_user_input', tone: 'cyan', title: 'Codex Question', Icon: CircleQuestionMark, cardTone: 'cyan' };
+  if (row.role === 'codex_plan') return { kind: 'codex_plan', tone: 'cyan', title: 'Codex Plan', Icon: ClipboardList, cardTone: 'cyan' };
+  if (row.role === 'codex_goal') return { kind: 'codex_goal', tone: 'orange', title: 'Codex Goal', Icon: Target, cardTone: 'orange' };
   if (row.role === 'trace') return { kind: 'assistant_thinking', tone: 'purple', title: traceDisplayLabel(row), Icon: Brain, cardTone: 'purple' };
   if (row.role === 'error') return { kind: 'runtime_error', tone: 'red', title: copy?.main.runtimeError ?? 'Runtime error', Icon: AlertTriangle, cardTone: 'red' };
   const kind = kindFromToolMetadata(row);
@@ -623,6 +737,16 @@ export function getTimelineAppearance(
 
 function isRuntimePlatform(value: unknown): value is RuntimePlatform {
   return value === 'openclaw' || value === 'hermes' || value === 'nanobot';
+}
+
+function isRuntimeBudgetPlatform(value: unknown): value is RuntimeBudgetPlatform {
+  return runtimeBudgetPlatforms.includes(value as RuntimeBudgetPlatform);
+}
+
+function isRuntimeBackedSession(
+  session: RuntimeGuardSession,
+): session is RuntimeGuardSession & { platform: RuntimePlatform; frontendOnly?: false } {
+  return !session.frontendOnly && isRuntimePlatform(session.platform);
 }
 
 function platformToAgent(platform: RuntimePlatform): AgentName {
@@ -675,6 +799,76 @@ export function runtimeSessionRecordToRuntimeGuardSession(
   };
 }
 
+export function localRuntimeSessionRecordToRuntimeGuardSession(
+  record: LocalRuntimeSessionRecord,
+): RuntimeGuardSession | null {
+  const sessionKey = firstText(record.session_key, record.source_session_id);
+  const sourceSessionId = firstText(record.source_session_id);
+  if (!sessionKey || !sourceSessionId) return null;
+  const platform = record.platform;
+  const agent = platformToAgent(platform);
+  const createdAt = firstText(record.created_at, record.updated_at) || new Date().toISOString();
+  const lastActivityAt = firstText(record.updated_at, record.created_at, createdAt);
+  const title = firstText(record.title, sourceSessionId) || `${agent} Session`;
+
+  return {
+    sessionKey,
+    historySessionId: sourceSessionId,
+    agent,
+    platform,
+    instanceId: firstText(record.instance_id) || `${platform}-default`,
+    workspacePath: firstText(record.cwd) || undefined,
+    title,
+    createdAt,
+    lastActivityAt,
+    status: 'ready',
+    autoTitlePending: false,
+  };
+}
+
+export function codexSessionRecordToRuntimeGuardSession(
+  record: CodexSessionRecord,
+): RuntimeGuardSession | null {
+  const id = firstText(record.id);
+  if (!id) return null;
+  const createdAt = firstText(record.created_at, record.updated_at) || new Date().toISOString();
+  const lastActivityAt = firstText(record.updated_at, record.created_at, createdAt);
+  const historyKind = record.history_kind ?? (record.source === 'cli' ? 'cli' : null);
+  const isXSafeClawHistory = historyKind === 'xsafeclaw' || record.originator === 'XSafeClaw';
+  const explicitTitle = firstText(record.title);
+  const preview = firstText(record.preview);
+  const explicitTitleIsRaw = Boolean(explicitTitle && runtimeTitleLooksLikeRawRequest(explicitTitle));
+  const title = explicitTitle && !explicitTitleIsRaw
+    ? explicitTitle
+    : (!isXSafeClawHistory && preview ? preview : `Codex ${id.slice(0, 8)}`);
+  const needsGeneratedTitle = isXSafeClawHistory && (!explicitTitle || explicitTitleIsRaw);
+  const codexTitleSourceMessage = needsGeneratedTitle && explicitTitleIsRaw
+    ? explicitTitle
+    : (needsGeneratedTitle && preview && runtimeTitleLooksLikeRawRequest(preview) ? preview : undefined);
+
+  return {
+    sessionKey: `codex:${id}`,
+    historySessionId: id,
+    agent: 'Codex',
+    platform: 'codex',
+    instanceId: 'codex-cli',
+    displayName: 'Codex CLI',
+    workspacePath: firstText(record.cwd) || undefined,
+    title,
+    createdAt,
+    lastActivityAt,
+    status: 'ready',
+    autoTitlePending: false,
+    codexTitleState: explicitTitle && !explicitTitleIsRaw ? 'generated_applied' : 'temporary',
+    codexTitleSourceMessage,
+    frontendOnly: true,
+    codexHistory: true,
+    codexHistoryKind: historyKind,
+    codexOriginator: record.originator ?? null,
+    codexDeletable: record.deletable ?? true,
+  };
+}
+
 export function mergeSessionHistorySessions(
   historySessions: RuntimeGuardSession[],
   openSessions: RuntimeGuardSession[],
@@ -685,13 +879,29 @@ export function mergeSessionHistorySessions(
   });
   openSessions.forEach(openSession => {
     const historySession = byKey.get(openSession.sessionKey);
-    byKey.set(openSession.sessionKey, historySession ? {
+    if (!historySession) {
+      byKey.set(openSession.sessionKey, openSession);
+      return;
+    }
+    const mergedSession = {
       ...historySession,
       ...openSession,
       historySessionId: historySession.historySessionId ?? openSession.historySessionId,
       lastActivityAt: historySession.lastActivityAt ?? openSession.lastActivityAt,
       workspacePath: openSession.workspacePath ?? historySession.workspacePath,
-    } : openSession);
+    };
+    byKey.set(openSession.sessionKey, historySession.codexHistory ? {
+      ...mergedSession,
+      agent: historySession.agent,
+      platform: historySession.platform,
+      instanceId: historySession.instanceId,
+      displayName: historySession.displayName ?? openSession.displayName,
+      workspacePath: historySession.workspacePath ?? openSession.workspacePath,
+      title: historySession.title || openSession.title,
+      createdAt: historySession.createdAt || openSession.createdAt,
+      frontendOnly: historySession.frontendOnly ?? openSession.frontendOnly,
+      codexHistory: true,
+    } : mergedSession);
   });
   return sortSessionsNewestFirst([...byKey.values()]);
 }
@@ -701,13 +911,27 @@ export function promoteRuntimeGuardSession(
   session: RuntimeGuardSession,
 ): RuntimeGuardSession[] {
   const existing = current.find(item => item.sessionKey === session.sessionKey);
-  const front = existing ? {
-    ...session,
-    ...existing,
-    historySessionId: existing.historySessionId ?? session.historySessionId,
-    lastActivityAt: session.lastActivityAt ?? existing.lastActivityAt,
-    workspacePath: existing.workspacePath ?? session.workspacePath,
-  } : session;
+  const front = existing ? (
+    session.codexHistory
+      ? {
+        ...existing,
+        ...session,
+        historySessionId: session.historySessionId ?? existing.historySessionId,
+        lastActivityAt: session.lastActivityAt ?? existing.lastActivityAt,
+        workspacePath: session.workspacePath ?? existing.workspacePath,
+        title: session.title || existing.title,
+        createdAt: session.createdAt || existing.createdAt,
+        frontendOnly: true,
+        codexHistory: true,
+      }
+      : {
+        ...session,
+        ...existing,
+        historySessionId: existing.historySessionId ?? session.historySessionId,
+        lastActivityAt: session.lastActivityAt ?? existing.lastActivityAt,
+        workspacePath: existing.workspacePath ?? session.workspacePath,
+      }
+  ) : session;
   return [front, ...current.filter(item => item.sessionKey !== session.sessionKey)];
 }
 
@@ -720,21 +944,53 @@ function loadRuntimeGuardSessions(): RuntimeGuardSession[] {
         const sessionKey = typeof item?.sessionKey === 'string' ? item.sessionKey : '';
         const platform = item?.platform;
         const agent = item?.agent;
-        if (!sessionKey || !['openclaw', 'hermes', 'nanobot'].includes(platform)) return null;
-        if (!['OpenClaw', 'Hermes', 'Nanobot'].includes(agent)) return null;
+        const isFrontendCodex = platform === 'codex' && agent === 'Codex';
+        const isRuntimeSession = isRuntimePlatform(platform) && ['OpenClaw', 'Hermes', 'Nanobot'].includes(agent);
+        if (!sessionKey || (!isRuntimeSession && !isFrontendCodex)) return null;
+        const historySessionId = typeof item?.historySessionId === 'string' ? item.historySessionId : undefined;
+        const codexHistory = isFrontendCodex && Boolean(item?.codexHistory);
+        if (
+          isFrontendCodex
+          && sessionKey.startsWith('codex:')
+          && !sessionKey.startsWith('codex:pending:')
+          && !historySessionId
+          && !codexHistory
+        ) {
+          return null;
+        }
+        const sessionAgent = (isFrontendCodex ? 'Codex' : agent) as AgentName;
+        const sessionPlatform = (isFrontendCodex ? 'codex' : platform) as RuntimeGuardSessionPlatform;
+        const storedTitle = typeof item?.title === 'string' ? item.title : '';
+        const storedTitleState = ['temporary', 'generated_pending', 'generated_applied'].includes(item?.codexTitleState)
+          ? item.codexTitleState
+          : undefined;
+        const storedCodexTitleIsRaw = isFrontendCodex && runtimeTitleLooksLikeRawRequest(storedTitle);
+        const normalizedTitle = isFrontendCodex
+          ? (
+            storedCodexTitleIsRaw
+              ? (storedTitle.match(/^Codex(?:\s+\d+)?$/i) ? storedTitle : 'Codex')
+              : (titleFromUserMessage(storedTitle, sessionAgent) || sessionAgent)
+          )
+          : (titleFromUserMessage(storedTitle, sessionAgent) || sessionAgent);
         return {
           sessionKey,
-          historySessionId: typeof item?.historySessionId === 'string' ? item.historySessionId : undefined,
-          agent,
-          platform,
+          historySessionId,
+          agent: sessionAgent,
+          platform: sessionPlatform,
           instanceId: typeof item?.instanceId === 'string' ? item.instanceId : '',
           displayName: typeof item?.displayName === 'string' ? item.displayName : undefined,
           workspacePath: typeof item?.workspacePath === 'string' ? item.workspacePath : undefined,
-          title: titleFromUserMessage(typeof item?.title === 'string' ? item.title : '', agent) || agent,
+          title: normalizedTitle,
           createdAt: typeof item?.createdAt === 'string' ? item.createdAt : new Date().toISOString(),
           lastActivityAt: typeof item?.lastActivityAt === 'string' ? item.lastActivityAt : undefined,
           status: item?.status === 'error' ? 'error' : 'ready',
           autoTitlePending: Boolean(item?.autoTitlePending),
+          codexTitleState: storedCodexTitleIsRaw ? 'temporary' : storedTitleState,
+          codexTitleSourceMessage: typeof item?.codexTitleSourceMessage === 'string'
+            ? item.codexTitleSourceMessage
+            : (storedCodexTitleIsRaw ? storedTitle : undefined),
+          frontendOnly: isFrontendCodex || Boolean(item?.frontendOnly),
+          codexHistory,
         };
       })
       .filter((item): item is RuntimeGuardSession => item !== null);
@@ -827,9 +1083,11 @@ function sessionWorkspacePath(
   copy: RuntimeGuardCopy,
 ): string {
   const exactInstance = instances.find(instance => instance.instance_id === session.instanceId);
-  const platformInstance = instances.find(instance => (
-    instance.platform === session.platform && instance.enabled && instance.workspace_path
-  ));
+  const platformInstance = isRuntimePlatform(session.platform)
+    ? instances.find(instance => (
+      instance.platform === session.platform && instance.enabled && instance.workspace_path
+    ))
+    : undefined;
   return firstText(
     session.workspacePath,
     exactInstance?.workspace_path,
@@ -939,6 +1197,8 @@ const runtimeTitleRequestPatterns = [
   /^(?:please|can you|could you|help me|i want to|i need to|check|look up|find out)\b/i,
   /\b(?:what|why|how|whether)\b/i,
 ];
+void runtimeTitleRequestPatterns;
+
 const runtimeTitleLeadInPatterns = [
   /^(?:请帮我|麻烦帮我|帮我|帮忙|请问|请|麻烦|我想|我要|能不能|可以)/i,
   /^(?:查询一下|查一下|查查|看一下|了解一下)/i,
@@ -1021,14 +1281,13 @@ function compactRuntimeRequestTitle(input: string): string {
 
 function runtimeTitleLooksLikeRawRequest(input: string): boolean {
   const cleaned = input.replace(/\s+/g, ' ').trim();
-  if (runtimeTitleRequestPatterns.some(pattern => pattern.test(cleaned))) return true;
   const cjkCount = cleaned.match(runtimeTitleCjkPattern)?.length ?? 0;
   runtimeTitleCjkPattern.lastIndex = 0;
-  if (cjkCount > 10 && /[?？]|吗|呢|怎么样|怎么|为什么|是否|难不难|简单|容易|帮我|请/.test(cleaned)) {
-    return true;
-  }
   const words = cleaned.match(runtimeTitleWordPattern)?.length ?? 0;
-  return words > 10 && /\?$|\b(can you|could you|please|help me|what|why|how|whether)\b/i.test(cleaned);
+  if (cjkCount > 0) {
+    return cjkCount > 14 || cleaned.length > 48;
+  }
+  return words > 8 || cleaned.length > 64;
 }
 
 export function titleFromUserMessage(input: string, fallback = ''): string {
@@ -1044,6 +1303,31 @@ export function titleFromUserMessage(input: string, fallback = ''): string {
     : compactFallback || fallbackCleaned;
   if (!safeTitle) return '';
   return safeTitle.length > 48 ? `${safeTitle.slice(0, 48).trimEnd()}...` : safeTitle;
+}
+
+function sseNumber(value: unknown): number | undefined {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function codexTimestampFromChunk(chunk: {
+  codex_started_at_ms?: unknown;
+  codex_completed_at_ms?: unknown;
+}): Date | undefined {
+  const timestamp = sseNumber(chunk.codex_started_at_ms) ?? sseNumber(chunk.codex_completed_at_ms);
+  return timestamp !== undefined ? new Date(timestamp) : undefined;
+}
+
+function codexMetadataFromChunk(chunk: {
+  codex_event_order?: unknown;
+  codex_started_at_ms?: unknown;
+  codex_completed_at_ms?: unknown;
+}): Pick<ChatMessage, 'codex_event_order' | 'codex_started_at_ms' | 'codex_completed_at_ms'> {
+  return {
+    codex_event_order: sseNumber(chunk.codex_event_order),
+    codex_started_at_ms: sseNumber(chunk.codex_started_at_ms),
+    codex_completed_at_ms: sseNumber(chunk.codex_completed_at_ms),
+  };
 }
 
 function runtimeGuardSessionBaseTitle(session: Pick<RuntimeGuardSession, 'agent' | 'title'>): string {
@@ -1085,17 +1369,45 @@ function formatValue(value: any): string {
   }
 }
 
+function isRuntimeAgentName(agent: AgentName): agent is RuntimeAgentName {
+  return agent !== 'Codex';
+}
+
 function agentToPlatform(agent: AgentName): RuntimePlatform {
+  if (!isRuntimeAgentName(agent)) return 'openclaw';
   return agentDefinitions.find(item => item.name === agent)?.platform ?? 'openclaw';
+}
+
+function normalizeCodexSessionConfig(config: CodexLocalConfig, models = FALLBACK_CODEX_MODEL_CATALOG): CodexLocalConfig {
+  return normalizeCodexSelection(config, models);
+}
+
+function codexReasoningLabel(reasoning: string, copy: RuntimeGuardCopy): string {
+  const labels = copy.codexComposer.reasoning as Record<string, string>;
+  return labels[reasoning] ?? reasoning;
+}
+
+function codexSpeedLabel(speed: string, copy: RuntimeGuardCopy): string {
+  const labels = copy.codexComposer.speed as Record<string, string>;
+  if (speed === 'priority') return labels.fast ?? 'Fast';
+  return labels[speed] ?? speed;
+}
+
+function codexSpeedDescription(speed: string, copy: RuntimeGuardCopy, description?: string | null): string {
+  const labels = copy.codexComposer.speedHint as Record<string, string>;
+  if (speed === 'priority') return description || labels.fast || '';
+  return description || labels[speed] || '';
 }
 
 function configureRouteForAgent(agent: AgentName): string {
   if (agent === 'Hermes') return '/hermes_configure';
   if (agent === 'Nanobot') return '/nanobot_configure';
+  if (agent === 'Codex') return '/codex_configure';
   return '/openclaw_configure';
 }
 
 function findRuntimeForAgentInInstances(agent: AgentName, instances: RuntimeInstance[]): RuntimeInstance | null {
+  if (!isRuntimeAgentName(agent)) return null;
   const platform = agentToPlatform(agent);
   return instances.find(instance => instance.platform === platform && instance.is_default)
     ?? instances.find(instance => instance.platform === platform)
@@ -1105,10 +1417,12 @@ function findRuntimeForAgentInInstances(agent: AgentName, instances: RuntimeInst
 function agentIconComponent(agent: AgentName): LucideIcon {
   if (agent === 'OpenClaw') return Zap;
   if (agent === 'Hermes') return Route;
-  return Cpu;
+  if (agent === 'Nanobot') return Cpu;
+  return Brain;
 }
 
 function agentClassName(agent: AgentName): string {
+  if (agent === 'Codex') return 'agent-codex';
   return agentDefinitions.find(item => item.name === agent)?.className ?? 'agent-openclaw';
 }
 
@@ -1128,16 +1442,6 @@ export function AgentIconBadge({
       <Icon />
     </span>
   );
-}
-
-function toolPermissionTone(permission: RuntimeGuardToolPermission): 'success' | 'warning' | 'asked' {
-  if (permission === 'Allowed') return 'success';
-  if (permission === 'Guard') return 'warning';
-  return 'asked';
-}
-
-function toolPermissionButtonLabel(permission: RuntimeGuardToolPermission, copy: RuntimeGuardCopy): string {
-  return permissionDisplayLabel(permission, copy);
 }
 
 function runtimeUnavailableMessage(instance: RuntimeInstance, copy?: RuntimeGuardCopy) {
@@ -1170,6 +1474,17 @@ function upsertApprovalItem(
 function responseStatus(error: unknown): number | null {
   const response = (error as { response?: { status?: unknown } } | null)?.response;
   return typeof response?.status === 'number' ? response.status : null;
+}
+
+function responseDetail(error: unknown, fallback: string): string {
+  const data = (error as { response?: { data?: unknown } } | null)?.response?.data;
+  if (typeof data === 'string' && data.trim()) return data.trim();
+  if (data && typeof data === 'object') {
+    const detail = (data as { detail?: unknown }).detail;
+    if (typeof detail === 'string' && detail.trim()) return detail.trim();
+  }
+  const message = (error as { message?: unknown } | null)?.message;
+  return typeof message === 'string' && message.trim() ? message.trim() : fallback;
 }
 
 function formatBlockedTime(timestamp: number): string {
@@ -1220,11 +1535,31 @@ function mapHistoryMessage(raw: any, platform?: RuntimePlatform): ChatMessage | 
 
   if (raw?.role === 'trace') {
     const evt = raw.trace_event && typeof raw.trace_event === 'object' ? raw.trace_event : {};
+    const traceType = typeof raw.trace_type === 'string'
+      ? raw.trace_type
+      : typeof evt.type === 'string'
+        ? evt.type
+        : 'trace_step';
+    const tracePhase = typeof raw.trace_phase === 'string'
+      ? raw.trace_phase
+      : typeof evt.phase === 'string'
+        ? evt.phase
+        : '';
+    const traceSummary = typeof raw.trace_summary === 'string'
+      ? raw.trace_summary
+      : typeof evt.summary === 'string'
+        ? evt.summary
+        : '';
+    const traceStep = typeof raw.trace_step === 'number'
+      ? raw.trace_step
+      : typeof evt.step === 'number'
+        ? evt.step
+        : undefined;
     if (!shouldDisplayTraceMessage(platform, {
-      type: typeof evt.type === 'string' ? evt.type : 'trace_step',
+      type: traceType,
       text: typeof raw.content === 'string' ? raw.content : '',
-      summary: typeof evt.summary === 'string' ? evt.summary : '',
-      phase: typeof evt.phase === 'string' ? evt.phase : '',
+      summary: traceSummary,
+      phase: tracePhase,
     })) {
       return null;
     }
@@ -1233,10 +1568,10 @@ function mapHistoryMessage(raw: any, platform?: RuntimePlatform): ChatMessage | 
       role: 'trace',
       content: typeof raw.content === 'string' ? raw.content : '',
       timestamp: raw.timestamp ? new Date(raw.timestamp) : new Date(),
-      trace_type: typeof evt.type === 'string' ? evt.type : 'trace_step',
-      trace_phase: typeof evt.phase === 'string' ? evt.phase : '',
-      trace_step: typeof evt.step === 'number' ? evt.step : undefined,
-      trace_summary: typeof evt.summary === 'string' ? evt.summary : '',
+      trace_type: traceType,
+      trace_phase: tracePhase,
+      trace_step: traceStep,
+      trace_summary: traceSummary,
     };
   }
 
@@ -1334,6 +1669,44 @@ function demoRightApprovalItem(): GuardPendingApproval | null {
     tool_action: 'write',
     timeline_kind: 'approval_request',
     risk_level: 'medium',
+  };
+}
+
+function demoCodexQuestionMessage(locale: string): ChatMessage | null {
+  if (typeof window === 'undefined') return null;
+  if (new URLSearchParams(window.location.search).get('demoCodexQuestion') !== '1') return null;
+
+  const isZh = locale === 'zh';
+  return {
+    id: 'demo-codex-question',
+    role: 'codex_question',
+    content: '',
+    timestamp: new Date(),
+    codex_request_id: 'demo-codex-question-request',
+    codex_thread_id: 'demo-thread',
+    codex_turn_id: 'demo-turn',
+    codex_item_id: 'demo-item',
+    codex_response_status: 'pending',
+    codex_questions: [{
+      id: 'demo-choice',
+      header: isZh ? '实现方式' : 'Implementation approach',
+      question: isZh
+        ? '我需要确认这次修改应该优先采用哪一种实现方式？'
+        : 'Which implementation approach should I prioritize for this change?',
+      is_other: true,
+      is_secret: false,
+      options: isZh
+        ? [
+            { label: '保持最小改动', description: '只完成当前交互所需的最小改动' },
+            { label: '补齐完整交互', description: '实现真实询问、回复和状态更新' },
+            { label: '先只做视觉验证', description: '先确认卡片视觉表现' },
+          ]
+        : [
+            { label: 'Keep the change minimal', description: 'Only implement what this interaction needs' },
+            { label: 'Complete the full interaction', description: 'Implement real question, reply, and status updates' },
+            { label: 'Only validate the visual first', description: 'Check the card presentation first' },
+          ],
+    }],
   };
 }
 
@@ -1542,6 +1915,219 @@ export function NewTaskModal({
   );
 }
 
+export function CodexNewTaskModal({
+  draft,
+  workspaceDir,
+  onWorkspaceChange,
+  onConfigChange,
+  onCreate,
+  onClose,
+  codexModels,
+  creating = false,
+}: {
+  draft: PendingCodexNewTask;
+  workspaceDir: string;
+  onWorkspaceChange: (workspaceDir: string) => void;
+  onConfigChange: (config: CodexLocalConfig) => void;
+  onCreate: () => void;
+  onClose: () => void;
+  codexModels: CodexModelCatalogItem[];
+  creating?: boolean;
+}) {
+  const { t } = useI18n();
+  const copy = t.runtimeGuard;
+  const codexCopy = copy.codexComposer;
+  const normalizedConfig = normalizeCodexSessionConfig(draft.config, codexModels);
+  const selectedCodexModel = findCodexModel(codexModels, normalizedConfig.defaultModel);
+  const reasoningOptionsForModel = codexReasoningOptionsForModel(selectedCodexModel);
+  const speedOptionsForModel = codexSpeedOptionsForModel(selectedCodexModel);
+  const [browseOpen, setBrowseOpen] = useState(false);
+  const [browsePath, setBrowsePath] = useState('');
+  const [browseEntries, setBrowseEntries] = useState<DirectoryBrowseEntry[]>([]);
+  const [browseParentPath, setBrowseParentPath] = useState<string | null>(null);
+  const [browseLoading, setBrowseLoading] = useState(false);
+  const [browseError, setBrowseError] = useState('');
+  useRuntimeGuardModalEscape(onClose);
+
+  const loadBrowsePath = useCallback(async (path?: string) => {
+    setBrowseLoading(true);
+    setBrowseError('');
+    try {
+      const { data } = await assetsAPI.browseDirectories(path);
+      setBrowsePath(data.current_path);
+      setBrowseParentPath(data.parent_path);
+      setBrowseEntries(data.entries);
+    } catch {
+      setBrowseError(copy.newTask.codexBrowseError);
+    } finally {
+      setBrowseLoading(false);
+    }
+  }, [copy.newTask.codexBrowseError]);
+
+  const openBrowse = () => {
+    setBrowseOpen(true);
+    void loadBrowsePath(workspaceDir.trim() || undefined);
+  };
+
+  const updateConfig = (patch: Partial<CodexLocalConfig>) => {
+    onConfigChange(normalizeCodexSessionConfig({
+      ...draft.config,
+      ...patch,
+    }, codexModels));
+  };
+  const createDisabled = creating || !workspaceDir.trim();
+
+  return (
+    <div className="rg-modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <div className="rg-list-modal rg-codex-new-task-modal" role="dialog" aria-modal="true" aria-label={copy.newTask.codexDialogLabel} onMouseDown={(event) => event.stopPropagation()}>
+        <button className="rg-modal-close" type="button" title={copy.newTask.codexCloseTitle} onClick={onClose}>
+          <X />
+        </button>
+        <h2>{copy.newTask.codexTitle}</h2>
+        <div className="rg-list-modal-subtitle">{copy.newTask.codexSubtitle}</div>
+
+        <div className="rg-codex-new-task-body">
+          <section className="rg-codex-new-task-card">
+            <span>{copy.newTask.codexTaskLabel}</span>
+            <p>{draft.requestText}</p>
+          </section>
+
+          <label className="rg-codex-new-task-field">
+            <span>{copy.newTask.codexWorkspaceLabel}</span>
+            <div className="rg-codex-new-task-workspace-row">
+              <input
+                aria-label={copy.newTask.codexWorkspaceAria}
+                onChange={event => onWorkspaceChange(event.target.value)}
+                placeholder={copy.newTask.codexWorkspacePlaceholder}
+                value={workspaceDir}
+              />
+              <button type="button" onClick={openBrowse}>
+                <FolderOpen />
+                {copy.newTask.codexBrowse}
+              </button>
+            </div>
+          </label>
+
+          {browseOpen && (
+            <div className="rg-codex-new-task-browser">
+              <div className="rg-codex-new-task-browser-head">
+                <strong>{copy.newTask.codexBrowseTitle}</strong>
+                <button type="button" onClick={() => setBrowseOpen(false)}>{copy.newTask.codexBrowseClose}</button>
+              </div>
+              <div className="rg-codex-new-task-browser-path">{browsePath || copy.newTask.codexWorkspacePlaceholder}</div>
+              <div className="rg-codex-new-task-browser-actions">
+                <button disabled={!browseParentPath || browseLoading} onClick={() => browseParentPath && void loadBrowsePath(browseParentPath)} type="button">
+                  {copy.newTask.codexBrowseUp}
+                </button>
+                <button disabled={!browsePath || browseLoading} onClick={() => browsePath && void loadBrowsePath(browsePath)} type="button">
+                  {browseLoading ? copy.newTask.codexBrowseLoading : copy.newTask.codexBrowseRefresh}
+                </button>
+                <button disabled={!browsePath} onClick={() => { onWorkspaceChange(browsePath); setBrowseOpen(false); }} type="button">
+                  {copy.newTask.codexUseFolder}
+                </button>
+              </div>
+              {browseError ? (
+                <div className="rg-codex-new-task-browser-empty">{browseError}</div>
+              ) : browseEntries.length > 0 ? (
+                <div className="rg-codex-new-task-browser-list">
+                  {browseEntries.map(entry => (
+                    <button key={entry.path} onClick={() => void loadBrowsePath(entry.path)} type="button">
+                      <FolderOpen />
+                      <span>{entry.name}</span>
+                      {entry.is_hidden && <em>{copy.newTask.codexHidden}</em>}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="rg-codex-new-task-browser-empty">
+                  {browseLoading ? copy.newTask.codexBrowseLoading : copy.newTask.codexBrowseEmpty}
+                </div>
+              )}
+            </div>
+          )}
+
+          <section className="rg-codex-new-task-card">
+            <div className="rg-codex-new-task-card-head">
+              <span>{copy.newTask.codexDefaultsTitle}</span>
+            </div>
+            <div className="rg-codex-new-task-settings">
+              <label>
+                <span>{copy.newTask.codexModel}</span>
+                <select
+                  aria-label={copy.newTask.codexModel}
+                  className="rg-codex-new-task-select"
+                  onChange={event => updateConfig({ defaultModel: event.target.value as CodexModelOption })}
+                  value={normalizedConfig.defaultModel}
+                >
+                  {codexModels.map(model => (
+                    <option className="rg-codex-new-task-select-option" key={model.id} value={model.id}>
+                      {model.display_name || model.model || model.id}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>{copy.newTask.codexReasoning}</span>
+                <select
+                  aria-label={copy.newTask.codexReasoning}
+                  className="rg-codex-new-task-select"
+                  onChange={event => updateConfig({ defaultReasoning: event.target.value as CodexReasoningLevel })}
+                  value={normalizedConfig.defaultReasoning}
+                >
+                  {reasoningOptionsForModel.map(reasoning => (
+                    <option className="rg-codex-new-task-select-option" key={reasoning} value={reasoning}>
+                      {codexReasoningLabel(reasoning, copy)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>{copy.newTask.codexSpeed}</span>
+                <select
+                  aria-label={copy.newTask.codexSpeed}
+                  className="rg-codex-new-task-select"
+                  onChange={event => updateConfig({ defaultSpeed: event.target.value as CodexSpeedOption })}
+                  value={normalizedConfig.defaultSpeed}
+                >
+                  {speedOptionsForModel.map(speed => (
+                    <option className="rg-codex-new-task-select-option" key={speed.id} value={speed.id}>
+                      {codexSpeedLabel(speed.id, copy)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>{copy.newTask.codexPermission}</span>
+                <select
+                  aria-label={copy.newTask.codexPermission}
+                  className="rg-codex-new-task-select"
+                  onChange={event => updateConfig({ permissionMode: event.target.value as CodexPermissionMode })}
+                  value={normalizedConfig.permissionMode}
+                >
+                  {codexPermissionOptions.map(permission => (
+                    <option className="rg-codex-new-task-select-option" key={permission} value={permission}>{codexCopy.permission[permission]}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </section>
+        </div>
+
+        <div className="rg-codex-new-task-actions">
+          <button className="rg-codex-new-task-secondary" type="button" onClick={onClose}>
+            {copy.newTask.codexCancel}
+          </button>
+          <button className="rg-new-task-create rg-codex-new-task-primary" disabled={createDisabled} onClick={onCreate} type="button">
+            {creating ? copy.newTask.codexCreatingSession : copy.newTask.codexCreateSession}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function SessionHistoryViewAllModal({
   sessions,
   loading,
@@ -1616,6 +2202,9 @@ export function SessionHistoryViewAllModal({
               const status = sessionHistoryStatus(session, activeSessionId);
               const displayTitle = formatRuntimeGuardSessionTitle(session);
               const baseTitle = runtimeGuardSessionBaseTitle(session);
+              const subtitle = session.codexHistory && session.workspacePath
+                ? session.workspacePath
+                : session.displayName || session.instanceId || session.platform;
               const messages = messageMap[session.sessionKey] ?? [];
               const pendingApprovals = Object.values(middleApprovalCardsBySession[session.sessionKey] ?? {})
                 .filter(card => card.status === 'pending').length;
@@ -1642,7 +2231,7 @@ export function SessionHistoryViewAllModal({
                     </span>
                     <span className="rg-session-modal-title">
                       <strong>{baseTitle}</strong>
-                      <em>{session.displayName || session.instanceId || session.platform}</em>
+                      <em>{subtitle}</em>
                     </span>
                     <span className="rg-session-modal-stats">
                       <span>{rgText(copy.sessionHistory.events, { count: messages.length })}</span>
@@ -1677,59 +2266,6 @@ export function SessionHistoryViewAllModal({
                   : copy.sessionHistory.noMatch}
             </div>
           )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-export function ToolsViewAllModal({
-  permissions,
-  onPermissionChange,
-  onClose,
-}: {
-  permissions: RuntimeGuardToolPermissions;
-  onPermissionChange: (toolId: RuntimeGuardToolId, permission: RuntimeGuardToolPermission) => void;
-  onClose: () => void;
-}) {
-  const { t } = useI18n();
-  const copy = t.runtimeGuard;
-  useRuntimeGuardModalEscape(onClose);
-
-  return (
-    <div className="rg-modal-backdrop" role="presentation" onMouseDown={(event) => {
-      if (event.target === event.currentTarget) onClose();
-    }}>
-      <div className="rg-list-modal rg-tools-list-modal" role="dialog" aria-modal="true" aria-labelledby="rg-tools-modal-title" onMouseDown={(event) => event.stopPropagation()}>
-        <button className="rg-modal-close" type="button" title={copy.toolsModal.closeTitle} onClick={onClose}>
-          <X />
-        </button>
-        <h2 id="rg-tools-modal-title">{copy.toolsModal.title}</h2>
-        <div className="rg-list-modal-scroll rg-tools-modal-scroll">
-          {configurableTools.map(tool => {
-            const ToolIcon = tool.icon;
-            const permission = permissions[tool.id];
-            const toolName = toolDisplayName(tool.id, copy);
-            return (
-              <article className="rg-tool-permission-row" key={tool.id}>
-                <span className="rg-tool-permission-mark"><ToolIcon /></span>
-                <strong>{toolName}</strong>
-                <div className="rg-permission-segment" role="group" aria-label={rgText(copy.toolsModal.permissionAria, { tool: toolName })}>
-                  {toolPermissionOptions.map(option => (
-                    <button
-                      aria-pressed={permission === option}
-                      className={permission === option ? 'is-active' : ''}
-                      key={option}
-                      onClick={() => onPermissionChange(tool.id, option)}
-                      type="button"
-                    >
-                      {toolPermissionButtonLabel(option, copy)}
-                    </button>
-                  ))}
-                </div>
-              </article>
-            );
-          })}
         </div>
       </div>
     </div>
@@ -1869,20 +2405,287 @@ export function BlockedViewAllModal({
   );
 }
 
+function codexQuestionsForMessage(msg: ChatMessage) {
+  if (msg.codex_questions?.length) return msg.codex_questions;
+  const legacyQuestion = msg.codex_question || msg.content;
+  if (!legacyQuestion && !(msg.codex_options?.length)) return [];
+  return [{
+    id: 'answer',
+    header: '',
+    question: legacyQuestion,
+    is_other: Boolean(msg.codex_allow_other),
+    is_secret: Boolean(msg.codex_secret),
+    options: (msg.codex_options ?? []).map(option => ({ label: option, description: '' })),
+  }];
+}
+
+function initialCodexQuestionAnswers(msg: ChatMessage): Record<string, string> {
+  const questions = codexQuestionsForMessage(msg);
+  const answers: Record<string, string> = {};
+  for (const question of questions) {
+    const answer = msg.codex_answer_values?.[question.id]?.[0];
+    if (answer) answers[question.id] = answer;
+  }
+  if (!Object.keys(answers).length && msg.codex_submitted_answer && questions[0]) {
+    answers[questions[0].id] = msg.codex_submitted_answer;
+  }
+  return answers;
+}
+
+function codexPlanStatusLabel(status?: string | null): string {
+  const normalized = String(status ?? '').trim().toLowerCase();
+  if (!normalized) return '';
+  if (normalized === 'inprogress' || normalized === 'in_progress') return 'In progress';
+  if (normalized === 'pending') return 'Pending';
+  if (normalized === 'completed' || normalized === 'complete') return 'Done';
+  return status ?? '';
+}
+
+function codexGoalStatusLabel(status?: string | null): string {
+  const normalized = String(status ?? '').trim().toLowerCase();
+  if (!normalized) return 'Unknown';
+  if (normalized === 'active') return 'Active';
+  if (normalized === 'paused') return 'Paused';
+  if (normalized === 'complete' || normalized === 'completed') return 'Complete';
+  if (normalized === 'blocked') return 'Blocked';
+  if (normalized === 'cleared') return 'Cleared';
+  return status ?? 'Unknown';
+}
+
+function codexPlanConfirmationQuestion(locale: string) {
+  const isZh = locale === 'zh';
+  return {
+    id: 'plan-confirmation',
+    header: '',
+    question: isZh ? '是否执行当前计划，或给出修改意见？' : 'Execute this plan, or provide changes?',
+    is_other: true,
+    is_secret: false,
+    options: [{
+      label: isZh ? '执行计划' : 'Execute plan',
+      description: '',
+    }],
+  };
+}
+
+function codexPlanConfirmationPlaceholder(locale: string) {
+  return locale === 'zh' ? '输入修改意见…' : 'Type changes to the plan...';
+}
+
+function codexPlanExecutePrompt(locale: string) {
+  return locale === 'zh' ? '请按刚才的计划开始执行。' : 'Please start executing the plan above.';
+}
+
+function codexPlanRevisionPrompt(locale: string, feedback: string) {
+  return locale === 'zh'
+    ? `请根据以下意见修改刚才的计划：\n${feedback}`
+    : `Please revise the plan above using this feedback:\n${feedback}`;
+}
+
+function isCodexPlanExecuteAnswer(answer: string) {
+  const trimmed = answer.trim();
+  return trimmed.toLowerCase() === 'execute plan' || trimmed === '执行计划';
+}
+
 export function TimelineMessage({
   msg,
   expanded,
   onToggle,
+  onCodexQuestionSubmit,
+  onCodexGoalClear,
 }: {
   msg: ChatMessage;
   expanded: boolean;
   onToggle: () => void;
+  onCodexQuestionSubmit?: (msg: ChatMessage, payload: CodexRequestUserInputResponseRequest) => void | Promise<void>;
+  onCodexGoalClear?: (msg: ChatMessage) => void | Promise<void>;
 }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const copy = t.runtimeGuard;
   const time = formatTime(msg.timestamp);
   const appearance = getTimelineAppearance(msg, copy);
   const AppearanceIcon = appearance.Icon;
+  const [codexQuestionAnswers, setCodexQuestionAnswers] = useState<Record<string, string>>(() => initialCodexQuestionAnswers(msg));
+  const [localCodexQuestionStatus, setLocalCodexQuestionStatus] = useState<'submitting' | 'submitted' | 'error' | null>(null);
+  const [localCodexQuestionError, setLocalCodexQuestionError] = useState('');
+
+  useEffect(() => {
+    setCodexQuestionAnswers(initialCodexQuestionAnswers(msg));
+    setLocalCodexQuestionStatus(null);
+    setLocalCodexQuestionError('');
+  }, [msg.codex_answer_values, msg.codex_questions, msg.codex_submitted_answer, msg.id]);
+
+  if (msg.role === 'codex_plan') {
+    const steps = msg.codex_plan_steps ?? [];
+    const planText = msg.codex_plan_text || msg.content;
+    return (
+      <div className="rg-stream-row rg-stream-codex-plan" data-kind={appearance.kind} data-tone={appearance.tone}>
+        <span className="rg-stream-time">{time}</span>
+        <AppearanceIcon className="rg-stream-icon" />
+        <div className="rg-stream-body">
+          <div className="rg-codex-plan-card">
+            <div className="rg-codex-plan-head">
+              <span className="rg-stream-title">Codex plan</span>
+            </div>
+            {msg.codex_plan_explanation && (
+              <MarkdownMessage content={msg.codex_plan_explanation} className="rg-codex-plan-markdown rg-codex-plan-explanation" />
+            )}
+            {steps.length > 0 && (
+              <ol className="rg-codex-plan-steps">
+                {steps.map((step, index) => (
+                  <li key={`${step.step}-${index}`}>
+                    <span>{step.step}</span>
+                    {step.status && <em>{codexPlanStatusLabel(step.status)}</em>}
+                  </li>
+                ))}
+              </ol>
+            )}
+            {planText && <MarkdownMessage content={planText} className="rg-codex-plan-markdown" />}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (msg.role === 'codex_goal') {
+    const goal = msg.codex_goal;
+    const objective = goal?.objective || msg.content;
+    const status = codexGoalStatusLabel(goal?.status);
+    return (
+      <div className="rg-stream-row rg-stream-codex-goal" data-kind={appearance.kind} data-tone={appearance.tone}>
+        <span className="rg-stream-time">{time}</span>
+        <AppearanceIcon className="rg-stream-icon" />
+        <div className="rg-stream-body">
+          <div className="rg-codex-goal-card">
+            <div className="rg-codex-goal-head">
+              <span className="rg-stream-title">Codex goal</span>
+              <em>{status}</em>
+            </div>
+            {objective && <p>{objective}</p>}
+            {goal?.status && goal.status !== 'cleared' && onCodexGoalClear && (
+              <button className="rg-codex-goal-clear" onClick={() => void onCodexGoalClear(msg)} type="button">
+                <Target />
+                <span>Clear goal</span>
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (msg.role === 'codex_question') {
+    const isZh = locale === 'zh';
+    const questions = codexQuestionsForMessage(msg);
+    const responseStatus = localCodexQuestionStatus ?? msg.codex_response_status ?? 'pending';
+    const isSubmitting = responseStatus === 'submitting';
+    const isAnswered = responseStatus === 'submitted' || responseStatus === 'resolved';
+    const allQuestionsAnswered = questions.length > 0 && questions.every(question => Boolean((codexQuestionAnswers[question.id] ?? '').trim()));
+    const statusText = responseStatus === 'submitting'
+      ? (isZh ? '发送中' : 'Sending')
+      : isAnswered
+        ? (isZh ? '已发送' : 'Sent')
+        : responseStatus === 'error'
+          ? (isZh ? '发送失败' : 'Failed')
+          : (isZh ? '等待用户回应' : 'Waiting for response');
+
+    const submitCodexQuestionAnswer = async () => {
+      if (!onCodexQuestionSubmit || !allQuestionsAnswered || isSubmitting || isAnswered) return;
+      const payload: CodexRequestUserInputResponseRequest = {
+        answers: Object.fromEntries(questions.map(question => [
+          question.id,
+          { answers: [(codexQuestionAnswers[question.id] ?? '').trim()] },
+        ])),
+      };
+      setLocalCodexQuestionStatus('submitting');
+      setLocalCodexQuestionError('');
+      try {
+        await onCodexQuestionSubmit(msg, payload);
+        setLocalCodexQuestionStatus('submitted');
+      } catch (error: any) {
+        setLocalCodexQuestionStatus('error');
+        setLocalCodexQuestionError(error?.message || (isZh ? '发送失败' : 'Failed to send'));
+      }
+    };
+
+    return (
+      <div className="rg-stream-row rg-stream-codex-question" data-kind={appearance.kind} data-tone={appearance.tone}>
+        <span className="rg-stream-time">{time}</span>
+        <AppearanceIcon className="rg-stream-icon" />
+        <div className="rg-stream-body">
+          <div className="rg-codex-question-card">
+            <div className="rg-codex-question-head">
+              <span className="rg-stream-title">{isZh ? 'Codex 询问' : 'Codex question'}</span>
+              <em>{statusText}</em>
+            </div>
+            {questions.map(question => {
+              const selectedAnswer = codexQuestionAnswers[question.id] ?? '';
+              const answerIsOption = question.options.some(option => option.label === selectedAnswer);
+              const controlsDisabled = isSubmitting || isAnswered;
+              const inputPlaceholder = msg.codex_question_kind === 'plan_confirmation'
+                ? codexPlanConfirmationPlaceholder(locale)
+                : question.options.length
+                  ? (isZh ? '或输入其他意见...' : 'Or type another answer...')
+                  : (isZh ? '输入你的回答...' : 'Type your answer...');
+              return (
+                <div className="rg-codex-question-block" key={question.id}>
+                  {question.header && <strong>{question.header}</strong>}
+                  <p>{question.question}</p>
+                  {question.options.length > 0 && (
+                    <div className="rg-codex-question-options">
+                      {question.options.map(option => (
+                        <button
+                          aria-label={option.label}
+                          className={selectedAnswer === option.label ? 'is-selected' : ''}
+                          disabled={controlsDisabled}
+                          key={option.label}
+                          onClick={() => setCodexQuestionAnswers(current => ({ ...current, [question.id]: option.label }))}
+                          type="button"
+                        >
+                          <span>{option.label}</span>
+                          {option.description && <small>{option.description}</small>}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {(question.is_other || question.options.length === 0) && (
+                    <input
+                      className="rg-codex-question-input"
+                      disabled={controlsDisabled}
+                      onChange={event => setCodexQuestionAnswers(current => ({ ...current, [question.id]: event.target.value }))}
+                      placeholder={inputPlaceholder}
+                      type={question.is_secret ? 'password' : 'text'}
+                      value={answerIsOption ? '' : selectedAnswer}
+                    />
+                  )}
+                  {selectedAnswer && (
+                    <div className="rg-codex-question-state">
+                      <CheckCircle2 />
+                      <span>{isZh ? '已选择：' : 'Selected: '}{selectedAnswer}</span>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {(msg.codex_error || localCodexQuestionError) && (
+              <div className="rg-codex-question-error">
+                <AlertCircle />
+                <span>{msg.codex_error || localCodexQuestionError}</span>
+              </div>
+            )}
+            <button
+              className="rg-codex-question-submit"
+              disabled={!allQuestionsAnswered || isSubmitting || isAnswered}
+              onClick={submitCodexQuestionAnswer}
+              type="button"
+            >
+              {isSubmitting ? <Loader2 className="is-spinning" /> : isAnswered ? <CheckCircle2 /> : <Send />}
+              <span>{isAnswered ? (isZh ? '已发送' : 'Sent') : (isZh ? '确认并发送' : 'Confirm and send')}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (msg.role === 'tool_call') {
     const resultText = formatValue(msg.result);
@@ -1968,6 +2771,7 @@ export default function RuntimeGuardConsole() {
   const { t, locale, setLocale } = useI18n();
   const copy = t.runtimeGuard;
   const navigate = useNavigate();
+  const location = useLocation();
   const runtimeInstancesQuery = useRuntimeInstances();
   const subscribeToChatStore = useCallback((listener: () => void) => chatStreamStore.subscribe(listener), []);
   const messageMap = useSyncExternalStore(subscribeToChatStore, () => chatStreamStore.getSnapshot());
@@ -1977,6 +2781,7 @@ export default function RuntimeGuardConsole() {
     OpenClaw: null,
     Hermes: null,
     Nanobot: null,
+    Codex: null,
   });
   const [installProbeFailed, setInstallProbeFailed] = useState(false);
   const [xsafeclawVersion, setXsafeclawVersion] = useState<string | null>(BUILD_TIME_XSAFECLAW_VERSION);
@@ -1984,13 +2789,15 @@ export default function RuntimeGuardConsole() {
   const [activeSessionId, setActiveSessionId] = useState(() => loadRuntimeGuardSessions()[0]?.sessionKey ?? '');
   const [sessionHistoryItems, setSessionHistoryItems] = useState<RuntimeGuardSession[]>([]);
   const [sessionHistoryLoading, setSessionHistoryLoading] = useState(true);
-  const [selectedAgent, setSelectedAgent] = useState<AgentName>('OpenClaw');
+  const [selectedAgent, setSelectedAgent] = useState<AgentName>(() => loadRuntimeGuardSessions()[0]?.agent ?? 'OpenClaw');
   const [draftBySessionKey, setDraftBySessionKey] = useState<Record<string, string>>(() => loadRuntimeGuardDrafts());
   const [loadingHistory, setLoadingHistory] = useState<string | null>(null);
   const [creatingAgent, setCreatingAgent] = useState<AgentName | null>(null);
   const [newTaskModalOpen, setNewTaskModalOpen] = useState(false);
   const [newTaskRequest, setNewTaskRequest] = useState('');
   const [newTaskCreating, setNewTaskCreating] = useState(false);
+  const [codexNewTaskDraft, setCodexNewTaskDraft] = useState<PendingCodexNewTask | null>(null);
+  const [codexNewTaskCreating, setCodexNewTaskCreating] = useState(false);
   const [expandedToolIds, setExpandedToolIds] = useState<Record<string, boolean>>({});
   const [isComposing, setIsComposing] = useState(false);
   const [approvalItems, setApprovalItems] = useState<GuardPendingApproval[]>([]);
@@ -2001,7 +2808,6 @@ export default function RuntimeGuardConsole() {
   const [blockedLoading, setBlockedLoading] = useState(true);
   const [activeRuntimeGuardModal, setActiveRuntimeGuardModal] = useState<RuntimeGuardModal>(null);
   const [blockedModalRange, setBlockedModalRange] = useState<BlockedModalRange>('24h');
-  const [toolPermissions, setToolPermissions] = useState<RuntimeGuardToolPermissions>(() => ({ ...defaultToolPermissions }));
   const [placeholder, setPlaceholder] = useState('');
   const [guardMode, setGuardMode] = useState<GuardMode>('Off');
   const [guardModeSyncing, setGuardModeSyncing] = useState(false);
@@ -2012,6 +2818,70 @@ export default function RuntimeGuardConsole() {
   const [budgetAmountInput, setBudgetAmountInput] = useState('');
   const [budgetPeriodInput, setBudgetPeriodInput] = useState('');
   const [budgetPeriodUnit, setBudgetPeriodUnit] = useState<BudgetPeriodUnit>('hour');
+  const initialCodexConfig = useMemo(() => normalizeCodexSessionConfig(loadCodexConfig(), FALLBACK_CODEX_MODEL_CATALOG), []);
+  const [codexModels, setCodexModels] = useState<CodexModelCatalogItem[]>(FALLBACK_CODEX_MODEL_CATALOG);
+  const [codexComposerMenu, setCodexComposerMenu] = useState<CodexComposerMenu>(null);
+  const [codexSubmenu, setCodexSubmenu] = useState<CodexSubmenu>(null);
+  const [codexPlanMode, setCodexPlanMode] = useState(false);
+  const [codexGoalMode, setCodexGoalMode] = useState(false);
+  const [codexPermissionMode, setCodexPermissionMode] = useState<CodexPermissionMode>(initialCodexConfig.permissionMode);
+  const [codexReasoningLevel, setCodexReasoningLevel] = useState<CodexReasoningLevel>(initialCodexConfig.defaultReasoning);
+  const [codexModel, setCodexModel] = useState<CodexModelOption>(initialCodexConfig.defaultModel);
+  const [codexSpeed, setCodexSpeed] = useState<CodexSpeedOption>(initialCodexConfig.defaultSpeed);
+  const [codexGoalBySessionKey, setCodexGoalBySessionKey] = useState<Record<string, ChatMessage['codex_goal']>>({});
+  const [codexRateLimitsState, setCodexRateLimitsState] = useState<CodexRateLimitsState>({
+    data: null,
+    loading: false,
+    error: null,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadCodexModels() {
+      try {
+        const { data } = await systemAPI.getCodexModels();
+        if (cancelled) return;
+        setCodexModels(catalogModelsOrFallback(data.models));
+      } catch {
+        if (cancelled) return;
+        setCodexModels(FALLBACK_CODEX_MODEL_CATALOG);
+      }
+    }
+    void loadCodexModels();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const normalized = normalizeCodexSessionConfig({
+      ...initialCodexConfig,
+      defaultModel: codexModel,
+      defaultReasoning: codexReasoningLevel,
+      defaultSpeed: codexSpeed,
+    }, codexModels);
+    if (normalized.defaultModel !== codexModel) setCodexModel(normalized.defaultModel);
+    if (normalized.defaultReasoning !== codexReasoningLevel) setCodexReasoningLevel(normalized.defaultReasoning);
+    if (normalized.defaultSpeed !== codexSpeed) {
+      setCodexSpeed(normalized.defaultSpeed);
+      setCodexSubmenu(current => (current === 'speed' ? null : current));
+    }
+  }, [codexModels, codexModel, codexReasoningLevel, codexSpeed, initialCodexConfig]);
+
+  useEffect(() => {
+    if (!codexComposerMenu) return undefined;
+    const closeOnOutsidePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      const composer = codexComposerRef.current;
+      if (!composer || !(target instanceof Node) || composer.contains(target)) return;
+      setCodexComposerMenu(null);
+      setCodexSubmenu(null);
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointerDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointerDown, true);
+    };
+  }, [codexComposerMenu]);
 
   useEffect(() => {
     const previousTitle = document.title;
@@ -2033,8 +2903,59 @@ export default function RuntimeGuardConsole() {
   });
   const taskScrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const codexComposerRef = useRef<HTMLDivElement>(null);
   const inFlightKeysRef = useRef<Set<string>>(new Set());
+  const codexGeneratedTitleRequestKeysRef = useRef<Set<string>>(new Set());
   const approvalRefreshTimerRef = useRef<number | null>(null);
+  const codexRateLimitsRequestRef = useRef(0);
+  const demoCodexNewTaskShownRef = useRef(false);
+
+  const demoCodexNewTask = useMemo(
+    () => new URLSearchParams(location.search).get('demoCodexNewTask') === '1',
+    [location.search],
+  );
+
+  useEffect(() => {
+    if (!demoCodexNewTask || demoCodexNewTaskShownRef.current) return;
+    demoCodexNewTaskShownRef.current = true;
+    const loadedConfig = loadCodexConfig();
+    const config = normalizeCodexSessionConfig({
+      ...loadedConfig,
+      workspaceDir: loadedConfig.workspaceDir.trim() || 'C:\\Users\\heng\\Desktop\\test',
+    }, codexModels);
+    setNewTaskModalOpen(false);
+    setCodexNewTaskDraft({
+      requestText: 'Use Codex for this task and confirm the session workspace before starting.',
+      seed: {
+        session_key: 'codex:pending:demo',
+        instance_id: 'codex-cli',
+        platform: 'codex',
+      },
+      config,
+      workspaceDir: config.workspaceDir,
+    });
+  }, [codexModels, demoCodexNewTask]);
+
+  const refreshCodexRateLimits = useCallback(async () => {
+    const requestId = codexRateLimitsRequestRef.current + 1;
+    codexRateLimitsRequestRef.current = requestId;
+    setCodexRateLimitsState(current => ({ ...current, loading: true, error: null }));
+    try {
+      const { data } = await systemAPI.getCodexRateLimits();
+      if (codexRateLimitsRequestRef.current !== requestId) return null;
+      setCodexRateLimitsState({
+        data,
+        loading: false,
+        error: data.status === 'ready' ? null : (data.error || data.message || data.status),
+      });
+      return data;
+    } catch (error) {
+      if (codexRateLimitsRequestRef.current !== requestId) return null;
+      const message = error instanceof Error ? error.message : 'Failed to load Codex rate limits.';
+      setCodexRateLimitsState({ data: null, loading: false, error: message });
+      return null;
+    }
+  }, []);
 
   const setMessageMap = useCallback((
     updaterOrValue: Record<string, ChatMessage[]> | ((prev: Record<string, ChatMessage[]>) => Record<string, ChatMessage[]>),
@@ -2049,6 +2970,7 @@ export default function RuntimeGuardConsole() {
   const activeSession = sessions.find(session => session.sessionKey === activeSessionId) ?? null;
   const activeSessionKey = activeSession?.sessionKey ?? '';
   const activeAgent = activeSession?.agent ?? selectedAgent;
+  const activeSessionIsCodex = activeSession?.agent === 'Codex';
   const activeMessages = useMemo(
     () => (activeSessionKey ? (messageMap[activeSessionKey] ?? []) : []),
     [activeSessionKey, messageMap],
@@ -2064,16 +2986,43 @@ export default function RuntimeGuardConsole() {
     () => buildTimelineScrollKey(activeTimelineRows),
     [activeTimelineRows],
   );
+  const demoCodexQuestion = useMemo(() => demoCodexQuestionMessage(locale), [locale]);
   const visibleSessionHistoryItems = useMemo(
     () => mergeSessionHistorySessions(sessionHistoryItems, sessions),
     [sessionHistoryItems, sessions],
   );
-  const sessionHistoryPreviewItems = useMemo(
-    () => visibleSessionHistoryItems.slice(0, 2),
-    [visibleSessionHistoryItems],
+  const installedSessionHistoryItems = useMemo(
+    () => visibleSessionHistoryItems.filter(session => installedAgents[session.agent] === true),
+    [installedAgents, visibleSessionHistoryItems],
   );
+  const sidebarSessionHistoryItems = installedSessionHistoryItems;
   const activeDraft = activeSession ? (draftBySessionKey[activeSession.sessionKey] ?? '') : '';
   const activeSending = activeSession ? (sendingMap[activeSession.sessionKey] ?? false) : false;
+  const codexComposerCopy = copy.codexComposer;
+  const selectedCodexModel = findCodexModel(codexModels, codexModel);
+  const codexAvailableReasoningOptions = codexReasoningOptionsForModel(selectedCodexModel);
+  const codexAvailableSpeedOptions = codexSpeedOptionsForModel(selectedCodexModel);
+  const codexPermissionLabel = codexComposerCopy.permission[codexPermissionMode];
+  const codexEffectiveSpeed: CodexSpeedOption = codexAvailableSpeedOptions.some(option => option.id === codexSpeed)
+    ? codexSpeed
+    : CODEX_STANDARD_SPEED_ID;
+  const codexEffectiveSpeedIsFast = codexEffectiveSpeed !== CODEX_STANDARD_SPEED_ID;
+  const codexModelSummary = `${shortCodexModelDisplay(codexModels, codexModel)} ${codexReasoningLabel(codexReasoningLevel, copy)}`;
+  const activeCodexGoal = activeSessionKey ? codexGoalBySessionKey[activeSessionKey] : null;
+  const toggleCodexPlanMode = () => {
+    const nextPlanMode = !codexPlanMode;
+    setCodexPlanMode(nextPlanMode);
+    if (nextPlanMode) {
+      setCodexGoalMode(false);
+    }
+  };
+  const toggleCodexGoalMode = () => {
+    const nextGoalMode = !codexGoalMode;
+    setCodexGoalMode(nextGoalMode);
+    if (nextGoalMode) {
+      setCodexPlanMode(false);
+    }
+  };
   const availableInstances = useMemo(
     () => (runtimeInstancesQuery.data?.instances ?? []).filter(instance => instance.enabled),
     [runtimeInstancesQuery.data?.instances],
@@ -2088,34 +3037,9 @@ export default function RuntimeGuardConsole() {
     }),
     [availableInstances, installProbeFailed, installedAgents],
   );
-  const activeBudgetPlatform = (activeSession?.platform ?? agentToPlatform(selectedAgent)) as RuntimeBudgetPlatform;
-  const sidebarTools = useMemo(() => ([
-    ...configurableTools.map(tool => {
-      const permission = toolPermissions[tool.id];
-      return {
-        ...tool,
-        name: toolDisplayName(tool.id, copy),
-        status: permissionDisplayLabel(permission, copy),
-        tone: toolPermissionTone(permission),
-      };
-    }).filter(tool => tool.id === 'shell' || tool.id === 'fileSystem' || tool.id === 'browser'),
-  ]), [copy, toolPermissions]);
-  const updateToolPermission = useCallback((toolId: RuntimeGuardToolId, permission: RuntimeGuardToolPermission) => {
-    if (toolPermissions[toolId] === permission) return;
-    const previousPermissions = toolPermissions;
-    const nextPermissions = { ...toolPermissions, [toolId]: permission };
-    setToolPermissions(nextPermissions);
-    guardAPI.setToolPolicies(toolPoliciesFromPermissions(nextPermissions))
-      .then(({ data }) => {
-        setToolPermissions(toolPermissionsFromPolicies(data.policies));
-      })
-      .catch(() => {
-        setToolPermissions(previousPermissions);
-        setPlaceholder('Failed to save tool permission.');
-        window.setTimeout(() => setPlaceholder(''), 2600);
-      });
-  }, [toolPermissions]);
-
+  const activeBudgetPlatform = isRuntimeBudgetPlatform(activeSession?.platform)
+    ? activeSession.platform
+    : agentToPlatform(selectedAgent);
   useEffect(() => {
     const updateLayoutFit = () => {
       const availableWidth = Math.max(1, window.innerWidth - RUNTIME_GUARD_RIGHT_EDGE_GUARD);
@@ -2164,10 +3088,30 @@ export default function RuntimeGuardConsole() {
   const fetchSessionHistory = useCallback(async (showLoading = false): Promise<RuntimeGuardSession[] | null> => {
     if (showLoading) setSessionHistoryLoading(true);
     try {
-      const { data } = await sessionsAPI.listRuntime({ page: 1, page_size: 100 });
-      const nextSessions = (data.sessions ?? [])
-        .map(runtimeSessionRecordToRuntimeGuardSession)
+      const [openclawResult, hermesResult, codexResult] = await Promise.allSettled([
+        systemAPI.listRuntimeSessions({ platform: 'openclaw', limit: 100 }),
+        systemAPI.listRuntimeSessions({ platform: 'hermes', limit: 100 }),
+        systemAPI.listCodexSessions({ limit: 100 }),
+      ]);
+      if (
+        openclawResult.status === 'rejected'
+        && hermesResult.status === 'rejected'
+        && codexResult.status === 'rejected'
+      ) {
+        return null;
+      }
+      const runtimeSessions = [
+        ...(openclawResult.status === 'fulfilled' ? (openclawResult.value.data.sessions ?? []) : []),
+        ...(hermesResult.status === 'fulfilled' ? (hermesResult.value.data.sessions ?? []) : []),
+      ]
+        .map(localRuntimeSessionRecordToRuntimeGuardSession)
         .filter((session): session is RuntimeGuardSession => session !== null);
+      const codexSessions = codexResult.status === 'fulfilled'
+        ? (codexResult.value.data.sessions ?? [])
+          .map(codexSessionRecordToRuntimeGuardSession)
+          .filter((session): session is RuntimeGuardSession => session !== null)
+        : [];
+      const nextSessions = [...runtimeSessions, ...codexSessions];
       setSessionHistoryItems(sortSessionsNewestFirst(nextSessions));
       return nextSessions;
     } catch {
@@ -2186,26 +3130,6 @@ export default function RuntimeGuardConsole() {
   }, [fetchSessionHistory]);
 
   useEffect(() => {
-    let cancelled = false;
-
-    guardAPI.toolPolicies()
-      .then(({ data }) => {
-        if (!cancelled) {
-          setToolPermissions(toolPermissionsFromPolicies(data.policies));
-        }
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setPlaceholder('Failed to load tool permissions.');
-        window.setTimeout(() => setPlaceholder(''), 2600);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
     if (activeSessionId && sessions.some(session => session.sessionKey === activeSessionId)) return;
     const nextActive = sessions[0] ?? null;
     setActiveSessionId(nextActive?.sessionKey ?? '');
@@ -2222,6 +3146,7 @@ export default function RuntimeGuardConsole() {
           OpenClaw: Boolean(res.data.openclaw_installed),
           Hermes: Boolean(res.data.hermes_installed),
           Nanobot: Boolean(res.data.nanobot_installed),
+          Codex: Boolean(res.data.codex_installed),
         });
         setXsafeclawVersion(res.data.xsafeclaw_version ?? BUILD_TIME_XSAFECLAW_VERSION);
         setInstallProbeFailed(false);
@@ -2277,10 +3202,30 @@ export default function RuntimeGuardConsole() {
 
   const loadHistory = useCallback(async (sessionKey: string, force = false) => {
     if (!force && chatStreamStore.hasLoadedMessages(sessionKey)) return;
+    const session = sessions.find(session => session.sessionKey === sessionKey);
+    if (session?.codexHistory && session.historySessionId) {
+      setLoadingHistory(sessionKey);
+      try {
+        const res = await systemAPI.getCodexSessionMessages(session.historySessionId);
+        const loaded = (res.data.messages ?? [])
+          .map((message: any) => mapHistoryMessage(message))
+          .filter((message): message is ChatMessage => message !== null);
+        setMessageMap(prev => ({ ...prev, [sessionKey]: loaded }));
+      } catch {
+        setMessageMap(prev => ({ ...prev, [sessionKey]: [] }));
+      } finally {
+        setLoadingHistory(current => (current === sessionKey ? null : current));
+      }
+      return;
+    }
+    if (session && !isRuntimeBackedSession(session)) {
+      setMessageMap(prev => ({ ...prev, [sessionKey]: prev[sessionKey] ?? [] }));
+      return;
+    }
     setLoadingHistory(sessionKey);
     try {
       const res = await chatAPI.getHistory(sessionKey);
-      const sessionPlatform = sessions.find(session => session.sessionKey === sessionKey)?.platform;
+      const sessionPlatform = session?.platform;
       const loaded = (res.data.messages ?? [])
         .map((message: any) => mapHistoryMessage(message, sessionPlatform))
         .filter((message): message is ChatMessage => message !== null);
@@ -2296,7 +3241,20 @@ export default function RuntimeGuardConsole() {
     if (activeSession?.sessionKey) {
       loadHistory(activeSession.sessionKey);
     }
-  }, [activeSession?.sessionKey, loadHistory]);
+  }, [activeSession?.sessionKey, activeSession?.codexHistory, activeSession?.historySessionId, loadHistory]);
+
+  useEffect(() => {
+    if (!demoCodexQuestion || !activeSession?.sessionKey || activeSession.agent !== 'Codex') return;
+    if (activeMessages.some(message => message.id === demoCodexQuestion.id)) return;
+    setMessageMap(current => {
+      const currentMessages = current[activeSession.sessionKey] ?? [];
+      if (currentMessages.some(message => message.id === demoCodexQuestion.id)) return current;
+      return {
+        ...current,
+        [activeSession.sessionKey]: [...currentMessages, demoCodexQuestion],
+      };
+    });
+  }, [activeMessages, activeSession?.agent, activeSession?.sessionKey, demoCodexQuestion, setMessageMap]);
 
   const syncMiddleApprovalCards = useCallback((
     items: GuardPendingApproval[],
@@ -2350,28 +3308,26 @@ export default function RuntimeGuardConsole() {
     [allBlockedItems],
   );
   const guardStatusSummary = useMemo(
-    () => calculateGuardStatusSummary(guardMode, toolPermissions, unresolvedApprovalItems),
-    [guardMode, toolPermissions, unresolvedApprovalItems],
+    () => calculateGuardStatusSummary(guardMode),
+    [guardMode],
   );
   const guardStatusRows = useMemo(
-    () => buildGuardStatusRows(guardMode, toolPermissions, unresolvedApprovalItems.length),
-    [guardMode, toolPermissions, unresolvedApprovalItems.length],
+    () => buildGuardStatusRows(guardMode),
+    [guardMode],
   );
   const agents: AgentDisplay[] = useMemo(
-    () => agentDefinitions.map(agent => {
+    () => sidebarAgentDefinitions.map(agent => {
       const installed = installedAgents[agent.name];
-      const probeUnknown = installed === null || installProbeFailed;
-      const inferredInstalled = probeUnknown
-        ? availableInstances.some(instance => instance.platform === agent.platform) || installed !== false
-        : Boolean(installed);
+      const inferredInstalled = installed === true;
       return {
         name: agent.name,
         className: agent.className,
         installed: inferredInstalled,
+        runtimeBacked: agent.runtimeBacked,
         status: runtimeGuardAgentStatus(agent.name, inferredInstalled, sessions, messageMap, sendingMap),
       };
     }),
-    [availableInstances, installProbeFailed, installedAgents, messageMap, sendingMap, sessions],
+    [installedAgents, messageMap, sendingMap, sessions],
   );
   const budgetStatus = runtimeBudgetStatuses[selectedBudgetPlatform] ?? defaultRuntimeBudgetStatus(selectedBudgetPlatform);
   const activeBudgetStatus = runtimeBudgetStatuses[activeBudgetPlatform] ?? defaultRuntimeBudgetStatus(activeBudgetPlatform);
@@ -2394,6 +3350,49 @@ export default function RuntimeGuardConsole() {
   const budgetResetText = budgetConfigured
     ? rgText(copy.sidebar.resetsIn, { time: formatBudgetRefreshTime(budgetRemainingMs, copy) })
     : rgText(copy.sidebar.totalCost, { agent: selectedBudgetAgentName });
+  const showCodexQuotaBudget = selectedAgent === 'Codex';
+  const codexFiveHourWindow = codexRateLimitsState.data?.five_hour ?? null;
+  const codexWeekWindow = codexRateLimitsState.data?.seven_day ?? null;
+  const codexFiveHourRemainingPercent = formatCodexQuotaPercent(codexFiveHourWindow?.remaining_percent);
+  const codexWeekRemainingPercent = formatCodexQuotaPercent(codexWeekWindow?.remaining_percent);
+  const codexFiveHourResetText = formatCodexQuotaRefresh(
+    codexFiveHourWindow,
+    'fiveHour',
+    codexRateLimitsState,
+    copy,
+    locale,
+  );
+  const codexWeekResetText = formatCodexQuotaRefresh(
+    codexWeekWindow,
+    'sevenDay',
+    codexRateLimitsState,
+    copy,
+    locale,
+  );
+
+  useEffect(() => {
+    if (!showCodexQuotaBudget) return;
+    void refreshCodexRateLimits();
+  }, [refreshCodexRateLimits, showCodexQuotaBudget]);
+
+  useEffect(() => {
+    if (!showCodexQuotaBudget) return undefined;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void refreshCodexRateLimits();
+      }
+    }, CODEX_QUOTA_REFRESH_INTERVAL_MS);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshCodexRateLimits();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [refreshCodexRateLimits, showCodexQuotaBudget]);
 
   const showToast = useCallback((message: string, timeout = 2600) => {
     setPlaceholder(message);
@@ -2604,10 +3603,74 @@ export default function RuntimeGuardConsole() {
     return session;
   }, [sessions, setMessageMap]);
 
+  const addCodexConversationSession = useCallback(async (
+    seed?: Partial<StartSessionResponse>,
+    configOverride?: CodexLocalConfig,
+  ) => {
+    const currentCodexConfig = normalizeCodexSessionConfig(configOverride ?? loadCodexConfig(), codexModels);
+    const nextModel = currentCodexConfig.defaultModel;
+    const nextSpeed = currentCodexConfig.defaultSpeed;
+    setCodexModel(nextModel);
+    setCodexReasoningLevel(currentCodexConfig.defaultReasoning);
+    setCodexSpeed(nextSpeed);
+    setCodexPermissionMode(currentCodexConfig.permissionMode);
+
+    const now = new Date().toISOString();
+    const sameAgentCount = sessions.filter(session => session.agent === 'Codex').length + 1;
+    const fallbackLabel = `Codex ${sameAgentCount}`;
+    const seedSessionKey = typeof seed?.session_key === 'string' && seed.session_key.startsWith('codex:pending:')
+      ? seed.session_key
+      : '';
+    const session: RuntimeGuardSession = {
+      sessionKey: seedSessionKey || `codex:pending:${uuidv4()}`,
+      agent: 'Codex',
+      platform: 'codex',
+      instanceId: seed?.instance_id || 'codex-cli',
+      displayName: seed?.instance?.display_name || 'Codex CLI',
+      workspacePath: currentCodexConfig.workspaceDir.trim() || undefined,
+      title: fallbackLabel,
+      createdAt: now,
+      lastActivityAt: now,
+      status: 'ready',
+      autoTitlePending: false,
+      codexTitleState: 'temporary',
+      frontendOnly: true,
+      codexModel: nextModel,
+      codexReasoningLevel: currentCodexConfig.defaultReasoning,
+      codexSpeed: nextSpeed,
+      codexPermissionMode: currentCodexConfig.permissionMode,
+    };
+
+    setSessions(current => [session, ...current]);
+    setSessionHistoryItems(current => sortSessionsNewestFirst([session, ...current.filter(item => item.sessionKey !== session.sessionKey)]));
+    setMessageMap(prev => ({ ...prev, [session.sessionKey]: [] }));
+    setDraftBySessionKey(current => ({ ...current, [session.sessionKey]: current[session.sessionKey] ?? '' }));
+    setActiveSessionId(session.sessionKey);
+    setSelectedAgent('Codex');
+    return session;
+  }, [codexModels, sessions, setMessageMap]);
+
   const openSession = useCallback(async (agent: AgentName, installed = true) => {
     if (creatingAgent) return;
     if (!installed) {
       showInstallHint(agent);
+      return;
+    }
+    if (agent === 'Codex') {
+      setCreatingAgent(agent);
+      setSelectedAgent(agent);
+      try {
+        await addCodexConversationSession();
+      } catch (err: any) {
+        const detail = String(err?.response?.data?.detail || err?.message || 'Codex safety instructions failed to load.');
+        showToast(detail);
+      } finally {
+        setCreatingAgent(null);
+      }
+      return;
+    }
+    if (!isRuntimeAgentName(agent)) {
+      showToast(rgText(copy.toasts.noEnabledRuntime, { agent }));
       return;
     }
     if (runtimeInstancesQuery.isLoading) {
@@ -2641,16 +3704,13 @@ export default function RuntimeGuardConsole() {
   }, [
     creatingAgent,
     addCreatedRuntimeSession,
+    addCodexConversationSession,
     findRuntimeForAgent,
     copy,
     runtimeInstancesQuery.isLoading,
     showInstallHint,
     showToast,
   ]);
-
-  const openSelectedAgentSession = () => {
-    openSession(selectedAgent, agents.find(agent => agent.name === selectedAgent)?.installed ?? true);
-  };
 
   const openNewTaskModal = () => {
     setNewTaskRequest('');
@@ -2669,6 +3729,17 @@ export default function RuntimeGuardConsole() {
     setNewTaskCreating(true);
     try {
       const res = await chatAPI.smartStartSession({ message: requestText });
+      if (res.data.selected_agent === 'Codex' || res.data.platform === 'codex') {
+        const config = normalizeCodexSessionConfig(loadCodexConfig(), codexModels);
+        setCodexNewTaskDraft({
+          requestText,
+          seed: res.data,
+          config,
+          workspaceDir: config.workspaceDir.trim(),
+        });
+        closeNewTaskModal();
+        return;
+      }
       const platform = normalizeRuntimePlatform(res.data.platform);
       const agent = platformToAgent(platform);
       const createdSession = addCreatedRuntimeSession(agent, res.data, findRuntimeForAgent(agent));
@@ -2681,6 +3752,29 @@ export default function RuntimeGuardConsole() {
     } finally {
       setNewTaskCreating(false);
       setCreatingAgent(null);
+    }
+  };
+
+  const confirmCodexNewTask = async () => {
+    if (!codexNewTaskDraft || codexNewTaskCreating) return;
+    const workspaceDir = codexNewTaskDraft.workspaceDir.trim();
+    if (!workspaceDir) return;
+
+    setCodexNewTaskCreating(true);
+    try {
+      const config = normalizeCodexSessionConfig({
+        ...codexNewTaskDraft.config,
+        workspaceDir,
+      }, codexModels);
+      const createdSession = await addCodexConversationSession(codexNewTaskDraft.seed, config);
+      const requestText = codexNewTaskDraft.requestText;
+      setCodexNewTaskDraft(null);
+      void sendMessageForSession(createdSession, requestText);
+    } catch (err: any) {
+      const detail = String(err?.response?.data?.detail || err?.message || copy.toasts.failedCreateSession);
+      showToast(detail);
+    } finally {
+      setCodexNewTaskCreating(false);
     }
   };
 
@@ -2730,11 +3824,25 @@ export default function RuntimeGuardConsole() {
   }, [activeSessionId]);
 
   const openHistorySession = useCallback((session: RuntimeGuardSession) => {
+    if (session.codexHistory) {
+      chatStreamStore.deleteMessages(session.sessionKey);
+      if (session.historySessionId) {
+        void systemAPI.resumeCodexConversation({
+          thread_id: session.historySessionId,
+          cwd: session.workspacePath || null,
+          model: codexModel,
+          permission_mode: codexPermissionMode,
+        }).catch((err: any) => {
+          const detail = String(err?.response?.data?.detail || err?.message || 'Codex safety instructions failed to load.');
+          showToast(detail);
+        });
+      }
+    }
     setSessions(current => promoteRuntimeGuardSession(current, session));
     setDraftBySessionKey(current => ({ ...current, [session.sessionKey]: current[session.sessionKey] ?? '' }));
     setSelectedAgent(session.agent);
     setActiveSessionId(session.sessionKey);
-  }, []);
+  }, [codexModel, codexPermissionMode, showToast]);
 
   const deleteHistorySession = async (session: RuntimeGuardSession) => {
     const removeLocalSession = () => {
@@ -2751,7 +3859,18 @@ export default function RuntimeGuardConsole() {
     }
 
     try {
-      await chatAPI.deleteSession(session.historySessionId);
+      if (session.platform === 'codex') {
+        if (session.codexDeletable === false) {
+          throw new Error('This Codex history source is not managed by XSafeClaw and cannot be deleted here.');
+        }
+        await systemAPI.deleteCodexSession(session.historySessionId);
+      } else if (session.platform === 'openclaw' || session.platform === 'hermes') {
+        await systemAPI.deleteRuntimeSession(session.platform, session.historySessionId, {
+          instance_id: session.instanceId,
+        });
+      } else {
+        await chatAPI.deleteSession(session.historySessionId);
+      }
       removeLocalSession();
       void fetchSessionHistory(false);
     } catch (error: unknown) {
@@ -2760,7 +3879,7 @@ export default function RuntimeGuardConsole() {
         void fetchSessionHistory(false);
         return;
       }
-      showToast('Failed to delete session history.');
+      showToast(responseDetail(error, 'Failed to delete session history.'));
     }
   };
 
@@ -2827,10 +3946,738 @@ export default function RuntimeGuardConsole() {
     )));
   }, []);
 
-  async function sendMessageForSession(session: RuntimeGuardSession, rawText: string) {
+  const applyCodexGeneratedTitle = useCallback((sessionKey: string, title: string) => {
+    const nextTitle = titleFromUserMessage(title, '');
+    if (!nextTitle) return;
+    setSessions(current => current.map(session => (
+      session.sessionKey === sessionKey
+        ? {
+            ...session,
+            title: nextTitle,
+            autoTitlePending: false,
+            codexTitleState: 'generated_applied',
+            codexTitleSourceMessage: undefined,
+          }
+        : session
+    )));
+    setSessionHistoryItems(current => current.map(session => (
+      session.sessionKey === sessionKey
+        ? {
+            ...session,
+            title: nextTitle,
+            autoTitlePending: false,
+            codexTitleState: 'generated_applied',
+            codexTitleSourceMessage: undefined,
+          }
+        : session
+    )));
+  }, []);
+
+  const keepTemporaryCodexTitle = useCallback((sessionKey: string) => {
+    const normalize = (session: RuntimeGuardSession): RuntimeGuardSession => {
+      if (session.sessionKey !== sessionKey || session.platform !== 'codex') return session;
+      if (session.codexTitleState === 'generated_applied') return session;
+      const currentTitle = session.title.trim();
+      const temporaryTitle = currentTitle && /^Codex(?:\s+\d+)?$/i.test(currentTitle) ? currentTitle : 'Codex';
+      return {
+        ...session,
+        title: temporaryTitle,
+        autoTitlePending: false,
+        codexTitleState: 'temporary',
+      };
+    };
+    setSessions(current => current.map(normalize));
+    setSessionHistoryItems(current => current.map(normalize));
+  }, []);
+
+  const requestCodexGeneratedTitle = useCallback((
+    sessionKey: string,
+    payload: {
+      thread_id: string;
+      message: string;
+      model?: string | null;
+      reasoning_effort?: string | null;
+      speed?: string | null;
+    },
+  ) => {
+    if (codexGeneratedTitleRequestKeysRef.current.has(sessionKey)) return;
+    codexGeneratedTitleRequestKeysRef.current.add(sessionKey);
+    void systemAPI.generateCodexSessionTitle(sessionKey, payload)
+      .then(({ data }) => {
+        applyCodexGeneratedTitle(sessionKey, data.title);
+      })
+      .catch(() => {
+        codexGeneratedTitleRequestKeysRef.current.delete(sessionKey);
+        keepTemporaryCodexTitle(sessionKey);
+      });
+  }, [applyCodexGeneratedTitle, keepTemporaryCodexTitle]);
+
+  useEffect(() => {
+    if (!activeSession?.codexHistory || !activeSession.historySessionId) return;
+    const sourceMessage = activeSession.codexTitleSourceMessage || activeSession.title;
+    if (!sourceMessage || /^Codex(?:\s+\d+)?$/i.test(sourceMessage.trim())) return;
+    const shouldGenerateTitle = activeSession.codexTitleState !== 'generated_applied'
+      || runtimeTitleLooksLikeRawRequest(activeSession.title)
+      || runtimeTitleLooksLikeRawRequest(sourceMessage);
+    if (!shouldGenerateTitle) return;
+    setSessions(current => current.map(session => (
+      session.sessionKey === activeSession.sessionKey
+        ? { ...session, codexTitleState: 'generated_pending' }
+        : session
+    )));
+    setSessionHistoryItems(current => current.map(session => (
+      session.sessionKey === activeSession.sessionKey
+        ? { ...session, codexTitleState: 'generated_pending' }
+        : session
+    )));
+    requestCodexGeneratedTitle(activeSession.sessionKey, {
+      thread_id: activeSession.historySessionId,
+      message: sourceMessage,
+      model: codexModel,
+      reasoning_effort: codexReasoningLevel,
+      speed: codexSpeed,
+    });
+  }, [
+    activeSession?.codexHistory,
+    activeSession?.historySessionId,
+    activeSession?.sessionKey,
+    activeSession?.title,
+    activeSession?.codexTitleSourceMessage,
+    activeSession?.codexTitleState,
+    codexModel,
+    codexReasoningLevel,
+    codexSpeed,
+    requestCodexGeneratedTitle,
+  ]);
+
+  const submitCodexQuestionResponse = async (
+    msg: ChatMessage,
+    payload: CodexRequestUserInputResponseRequest,
+  ) => {
+    if (!activeSession || activeSession.agent !== 'Codex') {
+      throw new Error('Codex session is not active.');
+    }
+    const sessionKey = activeSession.sessionKey;
+    const requestId = msg.codex_request_id;
+    const isPlanConfirmation = msg.codex_question_kind === 'plan_confirmation';
+    if (!requestId && !isPlanConfirmation) {
+      throw new Error('Codex request id is missing.');
+    }
+
+    const answerValues = Object.fromEntries(
+      Object.entries(payload.answers).map(([questionId, answer]) => [questionId, answer.answers]),
+    );
+    const updateQuestionMessage = (updater: (message: ChatMessage) => ChatMessage) => {
+      setMessageMap(prev => ({
+        ...prev,
+        [sessionKey]: (prev[sessionKey] ?? []).map(message => (
+          message.id === msg.id ? updater(message) : message
+        )),
+      }));
+    };
+
+    updateQuestionMessage(message => ({
+      ...message,
+      codex_response_status: 'submitting',
+      codex_answer_values: answerValues,
+      codex_error: undefined,
+    }));
+
+    if (isPlanConfirmation) {
+      const answer = Object.values(answerValues)[0]?.[0]?.trim() ?? '';
+      const executePlan = isCodexPlanExecuteAnswer(answer);
+      const nextPrompt = executePlan
+        ? codexPlanExecutePrompt(locale)
+        : codexPlanRevisionPrompt(locale, answer);
+      if (executePlan) {
+        setCodexPlanMode(false);
+      }
+      try {
+        await sendMessageForSession(activeSession, nextPrompt, {
+          codexPlanMode: !executePlan,
+          codexGoalMode: false,
+        });
+        updateQuestionMessage(message => ({
+          ...message,
+          codex_response_status: 'submitted',
+          codex_answer_values: answerValues,
+        }));
+      } catch (error: any) {
+        const detail = String(error?.message || 'Failed to send Codex response.');
+        updateQuestionMessage(message => ({
+          ...message,
+          codex_response_status: 'error',
+          codex_answer_values: answerValues,
+          codex_error: detail,
+        }));
+        throw new Error(detail);
+      }
+      return;
+    }
+
+    const nativeRequestId = requestId ?? '';
+    if (nativeRequestId.startsWith('demo-')) {
+      updateQuestionMessage(message => ({
+        ...message,
+        codex_response_status: 'submitted',
+        codex_answer_values: answerValues,
+      }));
+      return;
+    }
+
+    try {
+      await systemAPI.respondCodexUserInputRequest(sessionKey, nativeRequestId, payload);
+      updateQuestionMessage(message => ({
+        ...message,
+        codex_response_status: 'submitted',
+        codex_answer_values: answerValues,
+      }));
+    } catch (error: any) {
+      const detail = String(error?.response?.data?.detail || error?.message || 'Failed to send Codex response.');
+      updateQuestionMessage(message => ({
+        ...message,
+        codex_response_status: 'error',
+        codex_answer_values: answerValues,
+        codex_error: detail,
+      }));
+      throw new Error(detail);
+    }
+  };
+
+  const clearCodexGoal = useCallback(async (msg: ChatMessage) => {
+    if (!activeSession || activeSession.agent !== 'Codex') {
+      throw new Error('Codex session is not active.');
+    }
+    const sessionKey = activeSession.sessionKey;
+    const threadId = msg.codex_goal?.thread_id || activeSession.historySessionId || sessionKey.replace(/^codex:/, '');
+    await systemAPI.clearCodexGoal(sessionKey, { thread_id: threadId || null });
+    setCodexGoalBySessionKey(current => ({ ...current, [sessionKey]: null }));
+    setMessageMap(prev => ({
+      ...prev,
+      [sessionKey]: (prev[sessionKey] ?? []).map(message => (
+        message.id === msg.id
+          ? {
+              ...message,
+              content: message.content || msg.codex_goal?.objective || '',
+              codex_goal: { ...(message.codex_goal ?? {}), status: 'cleared' },
+            }
+          : message
+      )),
+    }));
+  }, [activeSession, setMessageMap]);
+
+  async function sendMessageForSession(
+    session: RuntimeGuardSession,
+    rawText: string,
+    options: { codexPlanMode?: boolean; codexGoalMode?: boolean } = {},
+  ) {
     const originalKey = session.sessionKey;
     const text = rawText.trim();
     if (!text || (sendingMap[originalKey] ?? false) || inFlightKeysRef.current.has(originalKey)) return;
+
+    if (session.agent === 'Codex') {
+      let activeKey = originalKey;
+      let activeThreadId: string | null = session.historySessionId
+        || (session.sessionKey.startsWith('codex:pending:') ? null : session.sessionKey.replace(/^codex:/, '') || null);
+      const normalizedSessionCodexConfig = normalizeCodexSessionConfig({
+        ...initialCodexConfig,
+        defaultModel: session.codexModel ?? codexModel,
+        defaultReasoning: session.codexReasoningLevel ?? codexReasoningLevel,
+        defaultSpeed: session.codexSpeed ?? codexSpeed,
+      }, codexModels);
+      const sessionCodexModel = normalizedSessionCodexConfig.defaultModel;
+      const sessionCodexReasoningLevel = normalizedSessionCodexConfig.defaultReasoning;
+      const sessionCodexSpeed = codexSpeedServiceTier(codexModels, sessionCodexModel, normalizedSessionCodexConfig.defaultSpeed);
+      const sessionCodexPermissionMode = session.codexPermissionMode ?? codexPermissionMode;
+      const effectiveCodexPlanMode = options.codexPlanMode ?? codexPlanMode;
+      const effectiveCodexGoalMode = options.codexGoalMode ?? codexGoalMode;
+      const activity = new Date();
+      const activityIso = activity.toISOString();
+      const userMsg: ChatMessage = {
+        id: uuidv4(),
+        role: 'user',
+        content: text,
+        timestamp: activity,
+      };
+      const pendingId = uuidv4();
+      const fallbackAssistantId = `assistant-${pendingId}`;
+      const workingIndicatorId = `codex-working-${pendingId}`;
+      const stripCodexWorkingIndicator = (messages: ChatMessage[]) => (
+        messages.filter(message => message.id !== workingIndicatorId)
+      );
+      const removeCodexWorkingIndicator = (sessionKey: string) => {
+        setMessageMap(prev => {
+          const messages = prev[sessionKey] ?? [];
+          if (!messages.some(message => message.id === workingIndicatorId)) return prev;
+          return { ...prev, [sessionKey]: stripCodexWorkingIndicator(messages) };
+        });
+      };
+      const workingIndicatorMsg: ChatMessage = {
+        id: workingIndicatorId,
+        role: 'assistant',
+        content: '',
+        timestamp: activity,
+        pending: true,
+        codex_event_order: Number.MAX_SAFE_INTEGER,
+      };
+
+      inFlightKeysRef.current.add(originalKey);
+      chatStreamStore.setSending(originalKey, true);
+      setDraftBySessionKey(current => ({ ...current, [originalKey]: '' }));
+      setSessions(current => current.map(session => (
+        session.sessionKey === originalKey
+          ? {
+              ...session,
+              lastActivityAt: activityIso,
+            }
+          : session
+      )));
+      setSessionHistoryItems(current => sortSessionsNewestFirst(current.map(session => (
+        session.sessionKey === originalKey
+          ? {
+              ...session,
+              lastActivityAt: activityIso,
+            }
+          : session
+      ))));
+      setMessageMap(prev => ({ ...prev, [originalKey]: [...(prev[originalKey] ?? []), userMsg, workingIndicatorMsg] }));
+
+      try {
+        if (!activeThreadId && !session.sessionKey.startsWith('codex:pending:')) {
+          throw new Error('Codex thread id is missing.');
+        }
+        const response = await fetch(`/api/system/codex/conversations/${encodeURIComponent(activeKey)}/turns/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: text,
+            thread_id: activeThreadId,
+            cwd: session.workspacePath || null,
+            model: sessionCodexModel,
+            reasoning_effort: sessionCodexReasoningLevel,
+            speed: sessionCodexSpeed,
+            permission_mode: sessionCodexPermissionMode,
+            plan_mode: effectiveCodexPlanMode,
+            goal_mode: effectiveCodexGoalMode,
+            goal_objective: effectiveCodexGoalMode ? text : null,
+          }),
+        });
+
+        if (!response.ok || !response.body) {
+          throw new Error(await responseErrorMessage(response, copy));
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let streamDone = false;
+        let sawCodexPlanUpdate = false;
+        let sawCodexNativeUserInputRequest = false;
+        let sawCodexTimelineContent = false;
+        let latestCodexPlanTurnId = '';
+        let latestCodexPlanItemId = '';
+
+        while (!streamDone) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const raw = line.slice(6).trim();
+            if (raw === '[DONE]') {
+              streamDone = true;
+              break;
+            }
+
+            try {
+              const chunk = JSON.parse(raw) as {
+                type: string;
+                text?: string;
+                tool_id?: string;
+                tool_name?: string;
+                args?: any;
+                result?: any;
+                is_error?: boolean;
+                tool_category?: string;
+                tool_action?: string;
+                timeline_kind?: string;
+                risk_level?: string;
+                request_id?: string;
+                thread_id?: string;
+                session_key?: string;
+                cwd?: string | null;
+                title?: string | null;
+                preview?: string | null;
+                source?: string | null;
+                originator?: string | null;
+                history_kind?: string | null;
+                deletable?: boolean;
+                turn_id?: string;
+                item_id?: string;
+                questions?: ChatMessage['codex_questions'];
+                explanation?: string | null;
+                steps?: ChatMessage['codex_plan_steps'];
+                delta?: string;
+                goal?: ChatMessage['codex_goal'];
+                phase?: string;
+                summary?: string;
+                codex_event_order?: number;
+                codex_started_at_ms?: number;
+                codex_completed_at_ms?: number;
+              };
+
+              const appendStreamMessage = (message: ChatMessage) => {
+                sawCodexTimelineContent = true;
+                setMessageMap(prev => {
+                  const messages = stripCodexWorkingIndicator(prev[activeKey] ?? []);
+                  messages.push(message);
+                  return { ...prev, [activeKey]: messages };
+                });
+              };
+
+              const upsertStreamMessage = (
+                messageId: string,
+                buildMessage: (existing?: ChatMessage) => ChatMessage,
+              ) => {
+                sawCodexTimelineContent = true;
+                setMessageMap(prev => {
+                  const messages = stripCodexWorkingIndicator(prev[activeKey] ?? []);
+                  const existingIndex = messages.findIndex(item => item.id === messageId);
+                  if (existingIndex >= 0) {
+                    messages[existingIndex] = buildMessage(messages[existingIndex]);
+                    return { ...prev, [activeKey]: messages };
+                  }
+                  messages.push(buildMessage());
+                  return { ...prev, [activeKey]: messages };
+                });
+              };
+
+              if (chunk.type === 'codex_session_started') {
+                const nextKey = typeof chunk.session_key === 'string' && chunk.session_key ? chunk.session_key : undefined;
+                const nextThreadId = typeof chunk.thread_id === 'string' && chunk.thread_id ? chunk.thread_id : undefined;
+                if (nextThreadId) {
+                  activeThreadId = nextThreadId;
+                }
+                if (nextKey) {
+                  const previousKey = activeKey;
+                  if (nextKey !== previousKey) {
+                    renameSessionKey(previousKey, nextKey);
+                    chatStreamStore.setSending(previousKey, false);
+                    chatStreamStore.setSending(nextKey, true);
+                    inFlightKeysRef.current.delete(previousKey);
+                    inFlightKeysRef.current.add(nextKey);
+                    activeKey = nextKey;
+                  }
+                  setSessions(current => current.map(item => (
+                    item.sessionKey === nextKey
+                      ? {
+                          ...item,
+                          historySessionId: nextThreadId || item.historySessionId,
+                          frontendOnly: false,
+                          codexHistory: false,
+                          codexHistoryKind: chunk.history_kind ?? item.codexHistoryKind ?? 'xsafeclaw',
+                          codexOriginator: chunk.originator ?? item.codexOriginator ?? 'XSafeClaw',
+                          codexDeletable: chunk.deletable ?? item.codexDeletable ?? true,
+                          codexTitleState: nextThreadId ? 'generated_pending' : item.codexTitleState,
+                          codexTitleSourceMessage: nextThreadId ? text : item.codexTitleSourceMessage,
+                          workspacePath: chunk.cwd || item.workspacePath,
+                        }
+                      : item
+                  )));
+                  setSessionHistoryItems(current => sortSessionsNewestFirst(current.map(item => (
+                    item.sessionKey === nextKey
+                      ? {
+                          ...item,
+                          historySessionId: nextThreadId || item.historySessionId,
+                          frontendOnly: false,
+                          codexHistory: false,
+                          codexHistoryKind: chunk.history_kind ?? item.codexHistoryKind ?? 'xsafeclaw',
+                          codexOriginator: chunk.originator ?? item.codexOriginator ?? 'XSafeClaw',
+                          codexDeletable: chunk.deletable ?? item.codexDeletable ?? true,
+                          codexTitleState: nextThreadId ? 'generated_pending' : item.codexTitleState,
+                          codexTitleSourceMessage: nextThreadId ? text : item.codexTitleSourceMessage,
+                          workspacePath: chunk.cwd || item.workspacePath,
+                        }
+                      : item
+                  ))));
+                  setCodexGoalBySessionKey(current => {
+                    if (previousKey === nextKey || !(previousKey in current)) return current;
+                    const next = { ...current, [nextKey]: current[previousKey] };
+                    delete next[previousKey];
+                    return next;
+                  });
+                  if (nextThreadId) {
+                    requestCodexGeneratedTitle(nextKey, {
+                      thread_id: nextThreadId,
+                      message: text,
+                      model: sessionCodexModel,
+                      reasoning_effort: sessionCodexReasoningLevel,
+                      speed: sessionCodexSpeed,
+                    });
+                  }
+                }
+              } else if (chunk.type === 'codex_thread_title') {
+                // XSafeClaw does not trust Codex app-server's automatic thread titles:
+                // they can be the raw first user request. The separate ephemeral
+                // title generator is the only source that updates Codex titles.
+                void chunk.title;
+              } else if (chunk.type === 'codex_assistant_start' && chunk.item_id) {
+                const assistantId = `assistant-${chunk.item_id}`;
+                const metadata = codexMetadataFromChunk(chunk);
+                upsertStreamMessage(assistantId, existing => ({
+                  id: assistantId,
+                  role: 'assistant',
+                  content: existing?.content || '',
+                  timestamp: existing?.timestamp ?? codexTimestampFromChunk(chunk) ?? new Date(),
+                  pending: true,
+                  codex_thread_id: chunk.thread_id || existing?.codex_thread_id,
+                  codex_turn_id: chunk.turn_id || existing?.codex_turn_id,
+                  codex_item_id: chunk.item_id || existing?.codex_item_id,
+                  codex_event_order: existing?.codex_event_order ?? metadata.codex_event_order,
+                  codex_started_at_ms: existing?.codex_started_at_ms ?? metadata.codex_started_at_ms,
+                  codex_completed_at_ms: existing?.codex_completed_at_ms ?? metadata.codex_completed_at_ms,
+                }));
+              } else if (chunk.type === 'delta' && typeof chunk.text === 'string') {
+                const assistantId = chunk.item_id ? `assistant-${chunk.item_id}` : fallbackAssistantId;
+                const metadata = codexMetadataFromChunk(chunk);
+                upsertStreamMessage(assistantId, existing => ({
+                  id: assistantId,
+                  role: 'assistant',
+                  content: `${existing?.content || ''}${chunk.text}`,
+                  timestamp: existing?.timestamp ?? codexTimestampFromChunk(chunk) ?? new Date(),
+                  pending: false,
+                  codex_thread_id: chunk.thread_id || existing?.codex_thread_id,
+                  codex_turn_id: chunk.turn_id || existing?.codex_turn_id,
+                  codex_item_id: chunk.item_id || existing?.codex_item_id,
+                  codex_event_order: existing?.codex_event_order ?? metadata.codex_event_order,
+                  codex_started_at_ms: existing?.codex_started_at_ms ?? metadata.codex_started_at_ms,
+                  codex_completed_at_ms: existing?.codex_completed_at_ms ?? metadata.codex_completed_at_ms,
+                }));
+              } else if (chunk.type === 'final') {
+                if (chunk.text || !sawCodexTimelineContent) {
+                  upsertStreamMessage(fallbackAssistantId, existing => ({
+                    id: fallbackAssistantId,
+                    role: 'assistant',
+                    content: chunk.text || existing?.content || '[No response]',
+                    timestamp: existing?.timestamp ?? new Date(),
+                    pending: false,
+                  }));
+                }
+              } else if (chunk.type === 'tool_start') {
+                const toolMessageId = `tool-${chunk.tool_id || uuidv4()}`;
+                const metadata = codexMetadataFromChunk(chunk);
+                upsertStreamMessage(toolMessageId, existing => ({
+                  ...existing,
+                  id: toolMessageId,
+                  role: 'tool_call',
+                  content: '',
+                  timestamp: existing?.timestamp ?? codexTimestampFromChunk(chunk) ?? new Date(),
+                  tool_id: chunk.tool_id,
+                  tool_name: chunk.tool_name,
+                  args: chunk.args,
+                  result_pending: true,
+                  tool_category: chunk.tool_category,
+                  tool_action: chunk.tool_action,
+                  timeline_kind: chunk.timeline_kind,
+                  risk_level: chunk.risk_level,
+                  codex_event_order: existing?.codex_event_order ?? metadata.codex_event_order,
+                  codex_started_at_ms: existing?.codex_started_at_ms ?? metadata.codex_started_at_ms,
+                  codex_completed_at_ms: existing?.codex_completed_at_ms ?? metadata.codex_completed_at_ms,
+                }));
+              } else if (chunk.type === 'tool_result') {
+                const toolMessageId = `tool-${chunk.tool_id || uuidv4()}`;
+                const metadata = codexMetadataFromChunk(chunk);
+                upsertStreamMessage(toolMessageId, existing => ({
+                  ...existing,
+                  id: toolMessageId,
+                  role: 'tool_call',
+                  content: '',
+                  timestamp: existing?.timestamp ?? codexTimestampFromChunk(chunk) ?? new Date(),
+                  tool_id: chunk.tool_id || existing?.tool_id,
+                  tool_name: chunk.tool_name || existing?.tool_name,
+                  args: existing?.args ?? chunk.args,
+                  result: chunk.result,
+                  is_error: chunk.is_error,
+                  result_pending: false,
+                  tool_category: chunk.tool_category || existing?.tool_category,
+                  tool_action: chunk.tool_action || existing?.tool_action,
+                  timeline_kind: chunk.timeline_kind || existing?.timeline_kind,
+                  risk_level: chunk.risk_level || existing?.risk_level,
+                  codex_event_order: existing?.codex_event_order ?? metadata.codex_event_order,
+                  codex_started_at_ms: existing?.codex_started_at_ms ?? metadata.codex_started_at_ms,
+                  codex_completed_at_ms: metadata.codex_completed_at_ms ?? existing?.codex_completed_at_ms,
+                }));
+              } else if (chunk.type === 'codex_user_input_request') {
+                sawCodexNativeUserInputRequest = true;
+                const requestId = String(chunk.request_id || uuidv4());
+                const metadata = codexMetadataFromChunk(chunk);
+                appendStreamMessage({
+                  id: `codex-question-${requestId}`,
+                  role: 'codex_question',
+                  content: '',
+                  timestamp: codexTimestampFromChunk(chunk) ?? new Date(),
+                  codex_request_id: requestId,
+                  codex_question_kind: 'native_request',
+                  codex_thread_id: chunk.thread_id,
+                  codex_turn_id: chunk.turn_id,
+                  codex_item_id: chunk.item_id,
+                  codex_questions: chunk.questions ?? [],
+                  codex_response_status: 'pending',
+                  ...metadata,
+                });
+              } else if (chunk.type === 'codex_plan_update') {
+                sawCodexPlanUpdate = true;
+                latestCodexPlanTurnId = chunk.turn_id || latestCodexPlanTurnId;
+                latestCodexPlanItemId = chunk.item_id || latestCodexPlanItemId;
+                const planId = `codex-plan-${chunk.turn_id || chunk.item_id || pendingId}`;
+                const metadata = codexMetadataFromChunk(chunk);
+                upsertStreamMessage(planId, existing => {
+                  const existingText = existing?.codex_plan_text || existing?.content || '';
+                  const nextText = typeof chunk.delta === 'string' && chunk.delta
+                    ? `${existingText}${chunk.delta}`
+                    : typeof chunk.text === 'string'
+                      ? chunk.text
+                      : existingText;
+                  return {
+                    id: planId,
+                    role: 'codex_plan',
+                    content: nextText,
+                    timestamp: existing?.timestamp ?? codexTimestampFromChunk(chunk) ?? new Date(),
+                    codex_thread_id: chunk.thread_id || existing?.codex_thread_id,
+                    codex_turn_id: chunk.turn_id || existing?.codex_turn_id,
+                    codex_item_id: chunk.item_id || existing?.codex_item_id,
+                    codex_event_order: existing?.codex_event_order ?? metadata.codex_event_order,
+                    codex_started_at_ms: existing?.codex_started_at_ms ?? metadata.codex_started_at_ms,
+                    codex_completed_at_ms: existing?.codex_completed_at_ms ?? metadata.codex_completed_at_ms,
+                    codex_plan_explanation: chunk.explanation ?? existing?.codex_plan_explanation ?? null,
+                    codex_plan_steps: Array.isArray(chunk.steps) && chunk.steps.length > 0
+                      ? chunk.steps
+                      : existing?.codex_plan_steps,
+                    codex_plan_text: nextText,
+                  };
+                });
+              } else if (chunk.type === 'codex_goal_update') {
+                const goal = {
+                  ...(chunk.goal ?? {}),
+                  thread_id: chunk.goal?.thread_id || chunk.thread_id || activeThreadId,
+                };
+                setCodexGoalBySessionKey(current => ({ ...current, [activeKey]: goal }));
+                const goalId = `codex-goal-${goal.thread_id || activeThreadId || pendingId}`;
+                upsertStreamMessage(goalId, existing => ({
+                  id: goalId,
+                  role: 'codex_goal',
+                  content: goal.objective || existing?.content || '',
+                  timestamp: existing?.timestamp ?? new Date(),
+                  codex_thread_id: goal.thread_id || chunk.thread_id || existing?.codex_thread_id,
+                  codex_turn_id: chunk.turn_id || existing?.codex_turn_id,
+                  codex_goal: goal,
+                }));
+              } else if (chunk.type === 'codex_goal_cleared') {
+                const clearedThreadId = chunk.thread_id || activeThreadId || undefined;
+                setCodexGoalBySessionKey(current => ({ ...current, [activeKey]: null }));
+                setMessageMap(prev => ({
+                  ...prev,
+                  [activeKey]: (prev[activeKey] ?? []).map(message => (
+                    message.role === 'codex_goal'
+                      && (!clearedThreadId || message.codex_goal?.thread_id === clearedThreadId || message.codex_thread_id === clearedThreadId)
+                      ? { ...message, codex_goal: { ...(message.codex_goal ?? {}), thread_id: clearedThreadId, status: 'cleared' } }
+                      : message
+                  )),
+                }));
+              } else if (chunk.type === 'codex_request_resolved') {
+                const requestId = chunk.request_id ? String(chunk.request_id) : '';
+                if (requestId) {
+                  setMessageMap(prev => ({
+                    ...prev,
+                    [activeKey]: (prev[activeKey] ?? []).map(message => (
+                      message.role === 'codex_question' && message.codex_request_id === requestId
+                        ? { ...message, codex_response_status: 'resolved' }
+                        : message
+                    )),
+                  }));
+                }
+              } else if (chunk.type === 'status' && chunk.text) {
+                const metadata = codexMetadataFromChunk(chunk);
+                appendStreamMessage({
+                  id: `trace-${uuidv4()}`,
+                  role: 'trace',
+                  content: chunk.text,
+                  timestamp: codexTimestampFromChunk(chunk) ?? new Date(),
+                  trace_type: chunk.phase || 'status',
+                  trace_phase: chunk.phase || 'codex',
+                  trace_summary: chunk.summary,
+                  ...metadata,
+                });
+              } else if (chunk.type === 'error') {
+                const metadata = codexMetadataFromChunk(chunk);
+                appendStreamMessage({
+                  id: `error-${uuidv4()}`,
+                  role: 'error' as const,
+                  content: chunk.text || 'Codex error',
+                  timestamp: codexTimestampFromChunk(chunk) ?? new Date(),
+                  pending: false,
+                  ...metadata,
+                });
+              }
+            } catch {
+              // Ignore malformed SSE data.
+            }
+          }
+        }
+
+        if (effectiveCodexPlanMode && sawCodexPlanUpdate && !sawCodexNativeUserInputRequest) {
+          const confirmationId = `codex-plan-confirm-${latestCodexPlanTurnId || latestCodexPlanItemId || pendingId}`;
+          const confirmationMessage: ChatMessage = {
+            id: confirmationId,
+            role: 'codex_question',
+            content: '',
+            timestamp: new Date(),
+            codex_request_id: `local:${confirmationId}`,
+            codex_question_kind: 'plan_confirmation',
+            codex_thread_id: activeThreadId || undefined,
+            codex_turn_id: latestCodexPlanTurnId || undefined,
+            codex_item_id: latestCodexPlanItemId || undefined,
+            codex_questions: [codexPlanConfirmationQuestion(locale)],
+            codex_response_status: 'pending',
+          };
+          setMessageMap(prev => {
+            const messages = [...(prev[activeKey] ?? [])];
+            if (messages.some(message => message.id === confirmationId)) return prev;
+            messages.push(confirmationMessage);
+            return { ...prev, [activeKey]: messages };
+          });
+        }
+      } catch (err: any) {
+        setMessageMap(prev => {
+          const messages = stripCodexWorkingIndicator(prev[activeKey] ?? prev[originalKey] ?? []);
+          messages.push({
+            id: `error-${uuidv4()}`,
+            role: 'error' as const,
+            content: `[Error] ${err.message}`,
+            timestamp: new Date(),
+            pending: false,
+          });
+          return { ...prev, [activeKey]: messages };
+        });
+      } finally {
+        removeCodexWorkingIndicator(originalKey);
+        removeCodexWorkingIndicator(activeKey);
+        chatStreamStore.setSending(originalKey, false);
+        chatStreamStore.setSending(activeKey, false);
+        inFlightKeysRef.current.delete(originalKey);
+        inFlightKeysRef.current.delete(activeKey);
+        void refreshCodexRateLimits();
+      }
+      return;
+    }
+
+    if (!isRuntimeBackedSession(session)) {
+      return;
+    }
 
     const sessionBudgetPlatform = session.platform as RuntimeBudgetPlatform;
     const sessionBudgetStatus = runtimeBudgetStatuses[sessionBudgetPlatform] ?? defaultRuntimeBudgetStatus(sessionBudgetPlatform);
@@ -3139,6 +4986,32 @@ export default function RuntimeGuardConsole() {
     await sendMessageForSession(activeSession, activeDraft);
   };
 
+  const handleCodexInterrupt = async () => {
+    if (!activeSession || isRuntimeBackedSession(activeSession)) return;
+    const key = activeSession.sessionKey;
+    try {
+      await fetch(`/api/system/codex/conversations/${encodeURIComponent(key)}/interrupt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          thread_id: activeSession.historySessionId || key.replace(/^codex:/, ''),
+        }),
+      });
+    } catch {
+      // The stream will surface a terminal state if the interrupt cannot be delivered.
+    }
+    setMessageMap(prev => ({
+      ...prev,
+      [key]: (prev[key] ?? []).map(message => (
+        message.pending
+          ? { ...message, content: copy.codexComposer.interrupted, pending: false }
+          : message
+      )),
+    }));
+    chatStreamStore.setSending(key, false);
+    inFlightKeysRef.current.delete(key);
+  };
+
   const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key !== 'Enter' || event.shiftKey || isComposing) return;
     event.preventDefault();
@@ -3207,6 +5080,22 @@ export default function RuntimeGuardConsole() {
           onCreate={() => void createNewTask()}
           onClose={closeNewTaskModal}
           creating={newTaskCreating}
+        />
+      )}
+      {codexNewTaskDraft && (
+        <CodexNewTaskModal
+          draft={codexNewTaskDraft}
+          workspaceDir={codexNewTaskDraft.workspaceDir}
+          onWorkspaceChange={(workspaceDir) => setCodexNewTaskDraft(current => (
+            current ? { ...current, workspaceDir } : current
+          ))}
+          onConfigChange={(config) => setCodexNewTaskDraft(current => (
+            current ? { ...current, config } : current
+          ))}
+          onCreate={() => void confirmCodexNewTask()}
+          onClose={() => setCodexNewTaskDraft(null)}
+          codexModels={codexModels}
+          creating={codexNewTaskCreating}
         />
       )}
       {budgetModalOpen && (
@@ -3290,16 +5179,9 @@ export default function RuntimeGuardConsole() {
           </div>
         </div>
       )}
-      {activeRuntimeGuardModal === 'tools' && (
-        <ToolsViewAllModal
-          permissions={toolPermissions}
-          onPermissionChange={updateToolPermission}
-          onClose={() => setActiveRuntimeGuardModal(null)}
-        />
-      )}
       {activeRuntimeGuardModal === 'sessions' && (
         <SessionHistoryViewAllModal
-          sessions={visibleSessionHistoryItems}
+          sessions={installedSessionHistoryItems}
           loading={sessionHistoryLoading}
           activeSessionId={activeSessionId}
           messageMap={messageMap}
@@ -3341,7 +5223,13 @@ export default function RuntimeGuardConsole() {
           <span>{copy.sidebar.newTask}</span>
         </button>
 
-        <section className="rg-agents">
+        <section
+          className="rg-agents"
+          style={{
+            top: RUNTIME_GUARD_SIDEBAR_LAYOUT.agentsTop,
+            height: RUNTIME_GUARD_SIDEBAR_LAYOUT.agentsHeight,
+          }}
+        >
           <div className="rg-section-title">
             <span>{copy.sidebar.agents}</span>
             <button type="button" title={copy.sidebar.setupTitle} onClick={() => navigate('/setup')}>+</button>
@@ -3355,6 +5243,10 @@ export default function RuntimeGuardConsole() {
                 ? rgText(copy.sidebar.runtimeConfigureTitle, { agent: agent.name })
                 : rgText(copy.sidebar.notInstalledTitle, { agent: agent.name })}
               onClick={() => {
+                if (!agent.runtimeBacked) {
+                  setSelectedAgent(agent.name);
+                  return;
+                }
                 if (!agent.installed) {
                   showInstallHint(agent.name);
                   return;
@@ -3365,6 +5257,10 @@ export default function RuntimeGuardConsole() {
                 event.preventDefault();
                 if (!agent.installed) {
                   showInstallHint(agent.name);
+                  return;
+                }
+                if (!agent.runtimeBacked) {
+                  navigate(configureRouteForAgent(agent.name));
                   return;
                 }
                 navigate(configureRouteForAgent(agent.name));
@@ -3399,56 +5295,113 @@ export default function RuntimeGuardConsole() {
           ))}
         </section>
 
-        <section className="rg-tools">
-          <div className="rg-tools-title">
-            <span>{copy.sidebar.toolPermission}</span>
-            <button type="button" onClick={() => setActiveRuntimeGuardModal('tools')}>{copy.sidebar.set}</button>
+        <section
+          className="rg-left-history"
+          style={{
+            top: RUNTIME_GUARD_SIDEBAR_LAYOUT.historyTop,
+            height: RUNTIME_GUARD_SIDEBAR_LAYOUT.historyHeight,
+          }}
+        >
+          <div className="rg-left-history-title">
+            <span>{copy.sessionHistory.title}</span>
+            <button
+              type="button"
+              onClick={() => {
+                void fetchSessionHistory(false);
+                setActiveRuntimeGuardModal('sessions');
+              }}
+            >
+              {copy.sidebar.manage}
+            </button>
           </div>
-          {sidebarTools.map((tool, index) => {
-            const ToolIcon = tool.icon;
-            return (
-              <div className="rg-tool-row" data-tool={tool.id} key={tool.name} style={{ top: 20 + index * 23 }}>
-                <ToolIcon />
-                <span>{tool.name}</span>
-                <span className={`rg-tool-${tool.tone}`}>{tool.status}</span>
+          <div className="rg-left-history-list">
+            {sidebarSessionHistoryItems.length > 0 ? (
+              sidebarSessionHistoryItems.map(session => {
+                const status = sessionHistoryStatus(session, activeSessionId);
+                const baseTitle = runtimeGuardSessionBaseTitle(session);
+                return (
+                  <div
+                    className={`rg-left-history-row-shell ${status === 'Active' ? 'is-active' : ''}`}
+                    key={session.sessionKey}
+                  >
+                    <button
+                      className="rg-left-history-row"
+                      onClick={() => openHistorySession(session)}
+                      type="button"
+                    >
+                      <AgentIconBadge agent={session.agent} size="compact" />
+                      <span className="rg-left-history-main">
+                        <span className="rg-left-history-session-title">{baseTitle}</span>
+                      </span>
+                      <span className="rg-left-history-time">{formatSessionHistoryTime(session.createdAt)}</span>
+                    </button>
+                    <button
+                      aria-label={`Delete sidebar session ${baseTitle}`}
+                      className="rg-left-history-delete"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        const confirmed = window.confirm(rgText(copy.sessionHistory.deleteConfirm, { title: baseTitle }));
+                        if (confirmed) void deleteHistorySession(session);
+                      }}
+                      title={`Delete sidebar session ${baseTitle}`}
+                      type="button"
+                    >
+                      <Trash2 size={10} strokeWidth={2.2} />
+                    </button>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="rg-left-history-empty">
+                {sessionHistoryLoading ? copy.main.loadingHistory : copy.sessionHistory.empty}
               </div>
-            );
-          })}
-        </section>
-
-        <section className="rg-safety-links">
-          <div className="rg-section-title">
-            <span>{copy.sidebar.safetyTools}</span>
-          </div>
-          <button className="rg-safety-row rg-safety-row-asset" onClick={() => navigate('/assets')} style={{ top: 22 }} type="button">
-            <Shield />
-            <span>{copy.sidebar.assetShield}</span>
-            <ChevronRight />
-          </button>
-          <button className="rg-safety-row rg-safety-row-risk" onClick={() => navigate('/risk-test')} style={{ top: 55 }} type="button">
-            <AlertTriangle />
-            <span>{copy.sidebar.riskTest}</span>
-            <ChevronRight />
-          </button>
-        </section>
-
-        <div className={`rg-budget ${selectedBudgetOverLimit ? 'is-over-limit' : ''}`}>
-          <div className="rg-budget-title">{copy.sidebar.budget}</div>
-          <button className="rg-budget-settings" type="button" onClick={openBudgetModal}>{copy.sidebar.set}</button>
-          <div className="rg-budget-amount-line">
-            <strong className="rg-budget-used">{budgetDisplayCostText}</strong>
-            {budgetConfigured && (
-              <>
-                <span className="rg-budget-slash">/</span>
-                <span className="rg-budget-limit">{budgetLimitText}</span>
-              </>
             )}
           </div>
-          <div className="rg-budget-bar"><span style={{ width: `${budgetBarPercent}%` }} /></div>
-          <div className="rg-budget-percent">{budgetConfigured ? `${Math.round(budgetPercent)}%` : ''}</div>
-          <div className="rg-budget-reset">
-            {selectedBudgetOverLimit ? rgText(copy.sidebar.budgetReached, { agent: selectedBudgetAgentName }) : budgetResetText}
-          </div>
+        </section>
+
+        <div
+          className={`rg-budget ${showCodexQuotaBudget ? 'rg-budget-codex' : ''} ${!showCodexQuotaBudget && selectedBudgetOverLimit ? 'is-over-limit' : ''}`}
+          style={{ top: RUNTIME_GUARD_SIDEBAR_LAYOUT.budgetTop }}
+        >
+          {showCodexQuotaBudget ? (
+            <>
+              <div className="rg-budget-title">{copy.sidebar.budget}</div>
+              <button className="rg-budget-settings" onClick={() => { void refreshCodexRateLimits(); }} type="button">
+                {copy.sidebar.codexQuotaAction}
+              </button>
+              <div className="rg-codex-quota-rows">
+                <div className="rg-codex-quota-row is-centered-columns">
+                  <strong className="rg-codex-quota-percent">{codexFiveHourRemainingPercent}</strong>
+                  <span className="rg-codex-quota-window">{copy.sidebar.codexQuotaFiveHour}</span>
+                  <span className="rg-codex-quota-refresh">{codexFiveHourResetText}</span>
+                </div>
+                <div className="rg-codex-quota-row is-centered-columns">
+                  <strong className="rg-codex-quota-percent">{codexWeekRemainingPercent}</strong>
+                  <span className="rg-codex-quota-window">{copy.sidebar.codexQuotaWeek}</span>
+                  <span className="rg-codex-quota-refresh">{codexWeekResetText}</span>
+                </div>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="rg-budget-title">{copy.sidebar.budget}</div>
+              <button className="rg-budget-settings" type="button" onClick={openBudgetModal}>{copy.sidebar.set}</button>
+              <div className="rg-budget-amount-line">
+                <strong className="rg-budget-used">{budgetDisplayCostText}</strong>
+                {budgetConfigured && (
+                  <>
+                    <span className="rg-budget-slash">/</span>
+                    <span className="rg-budget-limit">{budgetLimitText}</span>
+                  </>
+                )}
+              </div>
+              <div className="rg-budget-bar"><span style={{ width: `${budgetBarPercent}%` }} /></div>
+              <div className="rg-budget-percent">{budgetConfigured ? `${Math.round(budgetPercent)}%` : ''}</div>
+              <div className="rg-budget-reset">
+                {selectedBudgetOverLimit ? rgText(copy.sidebar.budgetReached, { agent: selectedBudgetAgentName }) : budgetResetText}
+              </div>
+            </>
+          )}
         </div>
 
       </aside>
@@ -3456,47 +5409,6 @@ export default function RuntimeGuardConsole() {
 
       <div className="rg-main-fluid" style={mainFluidStyle}>
       <main className="rg-main">
-        <div className="rg-tabs">
-          <div className="rg-session-tabs">
-            {sessions.map(session => (
-                <button
-                  className={`rg-chat-tab ${session.sessionKey === activeSessionId ? 'is-active' : ''}`}
-                  key={session.sessionKey}
-                  onClick={() => {
-                    setActiveSessionId(session.sessionKey);
-                    setSelectedAgent(session.agent);
-                  }}
-                  type="button"
-                >
-                  <span className="rg-chat-tab-agent">
-                    <AgentIconBadge agent={session.agent} size="compact" />
-                  </span>
-                  <span className="rg-chat-tab-title">{session.agent}</span>
-                  <span
-                    className="rg-chat-tab-close"
-                    role="button"
-                    tabIndex={0}
-                    title={copy.main.closeSessionTitle}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      closeSession(session.sessionKey);
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        closeSession(session.sessionKey);
-                      }
-                    }}
-                  >
-                    <X />
-                  </span>
-                </button>
-            ))}
-            <button className="rg-tab-add" type="button" onClick={openSelectedAgentSession} disabled={Boolean(creatingAgent)}>+</button>
-          </div>
-        </div>
-
         <section className="rg-task-title">
           <h1>{activeSession ? formatRuntimeGuardSessionTitle(activeSession) : copy.main.noSessionTitle}</h1>
           <p className="rg-session-meta">
@@ -3539,7 +5451,7 @@ export default function RuntimeGuardConsole() {
           </div>
         </section>
 
-        <section className="rg-task-panel">
+        <section className={`rg-task-panel ${activeSessionIsCodex ? 'has-codex-composer' : ''}`}>
           {!activeSession ? (
             <div className="rg-empty-task">
               <strong>{copy.main.noSessionTitle}</strong>
@@ -3571,41 +5483,264 @@ export default function RuntimeGuardConsole() {
                         msg={row.message}
                         expanded={Boolean(expandedToolIds[row.message.id])}
                         onToggle={() => toggleToolExpanded(row.message.id)}
+                        onCodexQuestionSubmit={submitCodexQuestionResponse}
+                        onCodexGoalClear={clearCodexGoal}
                       />
                     )
                   ))
                 )}
               </div>
 
-              <div className={`rg-command-input ${budgetOverLimit ? 'is-budget-blocked' : ''}`}>
-                <textarea
-                  ref={textareaRef}
-                  aria-label={rgText(copy.main.askAria, { agent: activeAgent })}
-                  disabled={budgetOverLimit || activeSending}
-                  onChange={(event) => updateActiveDraft(event.target.value)}
-                  onCompositionEnd={() => setIsComposing(false)}
-                  onCompositionStart={() => setIsComposing(true)}
-                  onKeyDown={handleInputKeyDown}
-                  placeholder={budgetOverLimit
-                    ? rgText(copy.sidebar.budgetReached, { agent: activeBudgetAgentName })
-                    : rgText(copy.main.askPlaceholder, { agent: activeAgent })}
-                  rows={2}
-                  value={activeDraft}
-                />
-                <span className="rg-command-shortcuts">
-                  {budgetOverLimit
-                    ? rgText(copy.sidebar.resetsIn, { time: formatBudgetRefreshTime(activeBudgetRemainingMs, copy) })
-                    : copy.main.shortcuts}
-                </span>
-                <button
-                  disabled={budgetOverLimit || activeSending || !activeDraft.trim()}
-                  onClick={handleSend}
-                  type="button"
-                  title={budgetOverLimit ? rgText(copy.sidebar.budgetReached, { agent: activeBudgetAgentName }) : copy.main.sendTitle}
-                >
-                  {activeSending ? <Loader2 className="is-spinning" /> : <Send />}
-                </button>
-              </div>
+              {activeSessionIsCodex ? (
+                <div className={`rg-codex-composer ${budgetOverLimit ? 'is-budget-blocked' : ''}`} ref={codexComposerRef}>
+                  <textarea
+                    ref={textareaRef}
+                    aria-label={rgText(copy.main.askAria, { agent: activeAgent })}
+                    disabled={budgetOverLimit}
+                    onChange={(event) => updateActiveDraft(event.target.value)}
+                    onCompositionEnd={() => setIsComposing(false)}
+                    onCompositionStart={() => setIsComposing(true)}
+                    onKeyDown={handleInputKeyDown}
+                    placeholder={budgetOverLimit
+                      ? rgText(copy.sidebar.budgetReached, { agent: activeBudgetAgentName })
+                      : rgText(copy.main.askPlaceholder, { agent: activeAgent })}
+                    rows={2}
+                    value={activeDraft}
+                  />
+                  <div className="rg-codex-toolbar">
+                    <div className="rg-codex-left-controls">
+                      <button
+                        aria-label={codexComposerCopy.optionsAria}
+                        className="rg-codex-icon-button"
+                        onClick={() => setCodexComposerMenu(current => (current === 'options' ? null : 'options'))}
+                        type="button"
+                      >
+                        <Plus />
+                      </button>
+                      <div className="rg-codex-permission-wrap">
+                        <button
+                          aria-label={`${codexComposerCopy.permissionAria}: ${codexPermissionLabel}`}
+                          className="rg-codex-permission-button"
+                          onClick={() => {
+                            setCodexSubmenu(null);
+                            setCodexComposerMenu(current => (current === 'permission' ? null : 'permission'));
+                          }}
+                          type="button"
+                        >
+                          <Shield />
+                          <span>{codexPermissionLabel}</span>
+                          <ChevronDown />
+                        </button>
+                        {codexComposerMenu === 'permission' && (
+                          <div className="rg-codex-menu rg-codex-permission-menu">
+                            <span className="rg-codex-menu-label">{codexComposerCopy.permissionSection}</span>
+                            {codexPermissionOptions.map(option => (
+                              <button
+                                className="rg-codex-option-row"
+                                key={option}
+                                onClick={() => {
+                                  setCodexPermissionMode(option);
+                                  setCodexComposerMenu(null);
+                                }}
+                                type="button"
+                              >
+                                <span>{codexComposerCopy.permission[option]}</span>
+                                {codexPermissionMode === option && <Check />}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      {codexPlanMode && (
+                        <span
+                          aria-label={codexComposerCopy.planMode}
+                          className="rg-codex-mode-indicator is-plan"
+                          role="img"
+                          title={codexComposerCopy.planMode}
+                        >
+                          <ClipboardList />
+                        </span>
+                      )}
+                      {(codexGoalMode || activeCodexGoal) && (
+                        <span
+                          aria-label={codexComposerCopy.pursueGoal}
+                          className="rg-codex-mode-indicator is-goal"
+                          role="img"
+                          title={codexComposerCopy.pursueGoal}
+                        >
+                          <Target />
+                        </span>
+                      )}
+                      {codexComposerMenu === 'options' && (
+                        <div className="rg-codex-menu rg-codex-options-menu">
+                          <button
+                            aria-pressed={codexPlanMode}
+                            className="rg-codex-toggle-row"
+                            onClick={toggleCodexPlanMode}
+                            type="button"
+                          >
+                            <span>{codexComposerCopy.planMode}</span>
+                            <span className="rg-codex-switch" data-on={codexPlanMode}><i /></span>
+                          </button>
+                          <button
+                            aria-pressed={codexGoalMode}
+                            className="rg-codex-toggle-row"
+                            onClick={toggleCodexGoalMode}
+                            type="button"
+                          >
+                            <span>{codexComposerCopy.pursueGoal}</span>
+                            <span className="rg-codex-switch" data-on={codexGoalMode}><i /></span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="rg-codex-toolbar-spacer" />
+
+                    <div className="rg-codex-right-controls">
+                      <div className="rg-codex-model-wrap">
+                      <button
+                        aria-label={`${codexComposerCopy.modelAria}: ${codexModelSummary}`}
+                        className={`rg-codex-model-button ${codexEffectiveSpeedIsFast ? 'is-fast' : 'is-standard'}`}
+                        onClick={() => {
+                          setCodexSubmenu(null);
+                          setCodexComposerMenu(current => (current === 'model' ? null : 'model'));
+                        }}
+                        type="button"
+                      >
+                        {codexEffectiveSpeedIsFast && <Zap />}
+                        <span>{codexModelSummary}</span>
+                        <ChevronDown />
+                      </button>
+                      {codexComposerMenu === 'model' && (
+                        <div className="rg-codex-menu rg-codex-model-menu">
+                          <span className="rg-codex-menu-label">{codexComposerCopy.reasoningSection}</span>
+                          {codexAvailableReasoningOptions.map(option => (
+                            <button
+                              className="rg-codex-option-row"
+                              key={option}
+                              onClick={() => setCodexReasoningLevel(option)}
+                              type="button"
+                            >
+                              <span>{codexReasoningLabel(option, copy)}</span>
+                              {codexReasoningLevel === option && <Check />}
+                            </button>
+                          ))}
+                          <span className="rg-codex-menu-divider" />
+                          <button
+                            className="rg-codex-option-row"
+                            onClick={() => setCodexSubmenu(current => (current === 'model' ? null : 'model'))}
+                            type="button"
+                          >
+                            <span>{codexEffectiveSpeedIsFast && <Zap />} {codexModelDisplayName(codexModels, codexModel)}</span>
+                            <ChevronRight />
+                          </button>
+                          {codexAvailableSpeedOptions.length > 1 && (
+                            <button
+                              className="rg-codex-option-row"
+                              onClick={() => setCodexSubmenu(current => (current === 'speed' ? null : 'speed'))}
+                              type="button"
+                            >
+                              <span>{codexComposerCopy.speedSection}</span>
+                              <ChevronRight />
+                            </button>
+                          )}
+                          {codexSubmenu === 'model' && (
+                            <div className="rg-codex-submenu is-model">
+                              <span className="rg-codex-menu-label">{codexComposerCopy.modelSection}</span>
+                              {codexModels.map(option => (
+                                <button
+                                  className="rg-codex-option-row"
+                                  key={option.id}
+                                  onClick={() => {
+                                    const normalized = normalizeCodexSessionConfig({
+                                      ...initialCodexConfig,
+                                      defaultModel: option.id,
+                                      defaultReasoning: codexReasoningLevel,
+                                      defaultSpeed: codexSpeed,
+                                    }, codexModels);
+                                    setCodexModel(normalized.defaultModel);
+                                    setCodexReasoningLevel(normalized.defaultReasoning);
+                                    setCodexSpeed(normalized.defaultSpeed);
+                                    setCodexSubmenu(null);
+                                  }}
+                                  type="button"
+                                >
+                                  <span>{option.display_name || option.model || option.id}</span>
+                                  {selectedCodexModel.id === option.id && <Check />}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                          {codexSubmenu === 'speed' && codexAvailableSpeedOptions.length > 1 && (
+                            <div className="rg-codex-submenu is-speed">
+                              <span className="rg-codex-menu-label">{codexComposerCopy.speedSection}</span>
+                              {codexAvailableSpeedOptions.map(option => (
+                                <button
+                                  className="rg-codex-option-row rg-codex-speed-row"
+                                  key={option.id}
+                                  onClick={() => {
+                                    setCodexSpeed(option.id);
+                                    setCodexSubmenu(null);
+                                  }}
+                                  type="button"
+                                >
+                                  <span className="rg-codex-speed-copy">
+                                    <strong>{codexSpeedLabel(option.id, copy)}</strong>
+                                    <small>{codexSpeedDescription(option.id, copy, option.description)}</small>
+                                  </span>
+                                  {codexEffectiveSpeed === option.id && <Check />}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      </div>
+                      <button
+                        aria-label={activeSending ? codexComposerCopy.interruptTitle : copy.main.sendTitle}
+                        className={`rg-codex-send ${activeSending ? 'is-interrupt' : ''}`}
+                        disabled={budgetOverLimit || (!activeSending && !activeDraft.trim())}
+                        onClick={activeSending ? handleCodexInterrupt : handleSend}
+                        title={activeSending ? codexComposerCopy.interruptTitle : copy.main.sendTitle}
+                        type="button"
+                      >
+                        {activeSending ? <X /> : <Send />}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className={`rg-command-input ${budgetOverLimit ? 'is-budget-blocked' : ''}`}>
+                  <textarea
+                    ref={textareaRef}
+                    aria-label={rgText(copy.main.askAria, { agent: activeAgent })}
+                    disabled={budgetOverLimit || activeSending}
+                    onChange={(event) => updateActiveDraft(event.target.value)}
+                    onCompositionEnd={() => setIsComposing(false)}
+                    onCompositionStart={() => setIsComposing(true)}
+                    onKeyDown={handleInputKeyDown}
+                    placeholder={budgetOverLimit
+                      ? rgText(copy.sidebar.budgetReached, { agent: activeBudgetAgentName })
+                      : rgText(copy.main.askPlaceholder, { agent: activeAgent })}
+                    rows={2}
+                    value={activeDraft}
+                  />
+                  <span className="rg-command-shortcuts">
+                    {budgetOverLimit
+                      ? rgText(copy.sidebar.resetsIn, { time: formatBudgetRefreshTime(activeBudgetRemainingMs, copy) })
+                      : copy.main.shortcuts}
+                  </span>
+                  <button
+                    disabled={budgetOverLimit || activeSending || !activeDraft.trim()}
+                    onClick={handleSend}
+                    type="button"
+                    title={budgetOverLimit ? rgText(copy.sidebar.budgetReached, { agent: activeBudgetAgentName }) : copy.main.sendTitle}
+                  >
+                    {activeSending ? <Loader2 className="is-spinning" /> : <Send />}
+                  </button>
+                </div>
+              )}
             </>
           )}
         </section>
@@ -3623,45 +5758,21 @@ export default function RuntimeGuardConsole() {
       </main>
       </div>
       <div className="rg-right-scale" style={rightScaleStyle}>
-        <section className="rg-session-history">
-          <div className="rg-card-head rg-session-history-head">
-            <span>{copy.sessionHistory.title.toUpperCase()}</span>
-            <button
-              type="button"
-              onClick={() => {
-                void fetchSessionHistory(false);
-                setActiveRuntimeGuardModal('sessions');
-              }}
-            >
-              {copy.sidebar.manage}
-            </button>
+        <section className="rg-right-tools">
+          <div className="rg-card-head rg-right-tools-head">
+            <span>{copy.sidebar.safetyTools}</span>
           </div>
-          <div className="rg-session-history-list">
-            {sessionHistoryPreviewItems.length > 0 ? (
-              sessionHistoryPreviewItems.map(session => {
-                const status = sessionHistoryStatus(session, activeSessionId);
-                const baseTitle = runtimeGuardSessionBaseTitle(session);
-                return (
-                  <button
-                    className="rg-session-history-row"
-                    key={session.sessionKey}
-                    onClick={() => openHistorySession(session)}
-                    type="button"
-                  >
-                    <span className="rg-session-history-time">{formatSessionHistoryTime(session.createdAt)}</span>
-                    <div className="rg-session-history-main">
-                      <strong>{session.agent}:</strong>
-                      <span>{baseTitle}</span>
-                    </div>
-                    <em className={status === 'Active' ? 'is-active' : ''}>{sessionStatusDisplay(status, copy)}</em>
-                  </button>
-                );
-              })
-            ) : (
-              <div className="rg-session-history-empty">
-                {sessionHistoryLoading ? copy.main.loadingHistory : copy.sessionHistory.empty}
-              </div>
-            )}
+          <div className="rg-right-tools-list">
+            <button className="rg-right-tool-row rg-safety-row-asset" onClick={() => navigate('/assets')} type="button">
+              <Shield />
+              <span>{copy.sidebar.assetShield}</span>
+              <ChevronRight />
+            </button>
+            <button className="rg-right-tool-row rg-safety-row-risk" onClick={() => navigate('/risk-test')} type="button">
+              <AlertTriangle />
+              <span>{copy.sidebar.riskTest}</span>
+              <ChevronRight />
+            </button>
           </div>
         </section>
         <aside className="rg-right-panel">

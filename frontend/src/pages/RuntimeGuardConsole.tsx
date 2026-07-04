@@ -1279,23 +1279,13 @@ function compactRuntimeRequestTitle(input: string): string {
 
 function runtimeTitleLooksLikeRawRequest(input: string): boolean {
   const cleaned = input.replace(/\s+/g, ' ').trim();
-  if (runtimeTitleRequestPatterns.some(pattern => pattern.test(cleaned))) return true;
   const cjkCount = cleaned.match(runtimeTitleCjkPattern)?.length ?? 0;
   runtimeTitleCjkPattern.lastIndex = 0;
-  if (
-    cjkCount >= 8
-    && /^(?:请|帮我|帮忙|我想|我要|首先|先|在.*?(?:工作区|根目录|目录).*?(?:创建|删除|修改|实现|生成|编写|写入|新建)|(?:创建|编写|实现).{4,})/.test(cleaned)
-  ) {
-    return true;
-  }
-  if (cjkCount >= 12 && /(?:文件名为|该脚本需|命令行|工作区|根目录|函数|实现[:：]?)/.test(cleaned)) {
-    return true;
-  }
-  if (cjkCount > 10 && /[?？]|吗|呢|怎么样|怎么|为什么|是否|难不难|简单|容易|帮我|请/.test(cleaned)) {
-    return true;
-  }
   const words = cleaned.match(runtimeTitleWordPattern)?.length ?? 0;
-  return words > 10 && /\?$|\b(can you|could you|please|help me|what|why|how|whether)\b/i.test(cleaned);
+  if (cjkCount > 0) {
+    return cjkCount > 14 || cleaned.length > 48;
+  }
+  return words > 8 || cleaned.length > 64;
 }
 
 export function titleFromUserMessage(input: string, fallback = ''): string {

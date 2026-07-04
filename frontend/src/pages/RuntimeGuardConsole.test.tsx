@@ -1661,6 +1661,64 @@ describe('NewTaskModal', () => {
     });
   });
 
+  it('keeps a concise generated Chinese Codex history title', async () => {
+    const { generateCodexSessionTitleSpy } = mockRuntimeGuardApis();
+    vi.mocked(systemAPI.installStatus).mockResolvedValue({
+      data: {
+        openclaw_installed: true,
+        hermes_installed: false,
+        nanobot_installed: true,
+        codex_installed: true,
+        xsafeclaw_version: '1.1.1',
+      },
+    } as any);
+    const generatedTitle = '\u521b\u5efa\u77e9\u9635\u8f6c\u7f6e\u811a\u672c';
+    const rawPreview = '\u5728\u5de5\u4f5c\u533a\u6839\u76ee\u5f55\u4e0b\u521b\u5efa\u4e00\u4e2a Python \u811a\u672c\uff0c\u6587\u4ef6\u540d\u4e3a matrix_transpose.py';
+    vi.mocked(systemAPI.listCodexSessions).mockResolvedValue({
+      data: {
+        installed: true,
+        status: 'ready',
+        sessions: [
+          {
+            id: 'thread-generated-chinese-title',
+            session_id: 'thread-generated-chinese-title',
+            title: generatedTitle,
+            preview: rawPreview,
+            cwd: 'E:/work/codex-demo',
+            created_at: '2026-06-15T12:00:00Z',
+            updated_at: '2026-06-15T13:00:00Z',
+            status: 'idle',
+            source: 'vscode',
+            originator: 'XSafeClaw',
+            history_kind: 'xsafeclaw',
+            deletable: true,
+            path: 'C:/Users/heng/.codex/sessions/rollout-thread-generated-chinese-title.jsonl',
+            cli_version: '0.139.0',
+          },
+        ],
+        next_cursor: null,
+        message: '',
+        error: null,
+      },
+    } as any);
+
+    const { container } = renderRuntimeGuardConsole();
+    const row = await waitFor(() => {
+      const node = container.querySelector('.rg-left-history-row') as HTMLElement | null;
+      expect(node).toBeTruthy();
+      expect(node?.textContent).toContain(generatedTitle);
+      return node as HTMLElement;
+    });
+    expect(row.textContent).not.toContain('Codex thread');
+
+    fireEvent.click(row);
+
+    await waitFor(() => {
+      expect(container.querySelector('.rg-task-title h1')?.textContent).toBe(generatedTitle);
+    });
+    expect(generateCodexSessionTitleSpy).not.toHaveBeenCalled();
+  });
+
   it('keeps the temporary Codex title when generated title lookup fails', async () => {
     const { sendMessageStreamSpy, generateCodexSessionTitleSpy } = mockRuntimeGuardApis();
     let rejectTitle: ((reason?: unknown) => void) | undefined;

@@ -66,6 +66,7 @@ Desktop.ini
 .pytest_cache/
 .pytest-tmp/
 .pytest_tmp/
+.tmp-pytest*/
 pytest-cache-files-*/
 .coverage
 .coverage.*

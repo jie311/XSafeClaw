@@ -3018,49 +3018,114 @@ async def _open_codex_conversation_via_app_server(
                 await stderr_task
 
 
-def _codex_title_prompt(message: str) -> str:
+_CODEX_TITLE_MAX_CJK_CHARS = 14
+_CODEX_TITLE_MAX_WORDS = 8
+_CODEX_TITLE_MAX_CHARS = 64
+_CODEX_TITLE_MAX_ATTEMPTS = 3
+_CODEX_TITLE_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+_CODEX_TITLE_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?")
+
+
+def _codex_title_prompt(message: str, *, previous_title: str = "", length_issue: str = "") -> str:
     request_text = re.sub(r"\s+", " ", str(message or "")).strip()[:1600]
+    retry_note = ""
+    if previous_title:
+        retry_note = (
+            "The previous title was too long and must be regenerated.\n"
+            f"Length problem: {length_issue or 'title exceeds the allowed length'}\n"
+            f"Previous title: {previous_title[:200]}\n"
+            "Return a shorter replacement title only.\n\n"
+        )
     return (
         "Generate a concise user-facing title for this Codex conversation.\n"
         "Summarize the task intent; do not copy or paraphrase the full request.\n"
         "Return only the title text. Do not use tools. Do not answer the request.\n"
         "Do not use Markdown, bullets, quotes, punctuation wrappers, or a trailing period.\n"
         "If the request is Chinese, use Chinese. If it is English, use English.\n"
-        "Chinese titles should be 4 to 12 characters when possible; English titles should be 2 to 6 words.\n\n"
+        "Chinese titles should be 4 to 12 characters when possible and must be at most 14 Chinese characters.\n"
+        "English titles should be 2 to 6 words when possible and must be at most 8 words.\n\n"
+        f"{retry_note}"
         f"User request:\n{request_text}"
     )
 
 
-def _codex_title_overlap_text(value: str) -> str:
-    return re.sub(r"\s+", "", str(value or "")).strip().casefold()
-
-
-def _codex_generated_title_looks_like_request_prefix(title: str, source_message: str) -> bool:
-    title_text = _codex_title_overlap_text(title)
-    source_text = _codex_title_overlap_text(source_message)
-    if not title_text or not source_text:
-        return False
-    if len(source_text) <= len(title_text) + 4:
-        return False
-    if len(title_text) >= 4 and source_text.startswith(title_text):
-        return True
-    prefix_window = source_text[: max(48, len(title_text) * 3)]
-    return len(title_text) >= 8 and title_text in prefix_window
-
-
-def _codex_clean_generated_title(raw_title: str, *, source_message: str = "", fallback: str = "") -> str:
-    title = guard_service.clean_runtime_session_title(str(raw_title or ""), fallback=fallback)
-    if not title or title == "New session":
-        return ""
-    if re.fullmatch(r"codex(?:\s+(?:cli|session|\d+))?", title, flags=re.IGNORECASE):
-        return ""
-    if guard_service._runtime_title_looks_like_request(title):  # pyright: ignore[reportPrivateUsage]
-        return ""
-    if _codex_generated_title_looks_like_request_prefix(title, source_message):
-        return ""
-    if guard_service._runtime_title_violates_generated_length(title):  # pyright: ignore[reportPrivateUsage]
-        return ""
+def _codex_clean_generated_title(raw_title: str, *, fallback: str = "") -> str:
+    text = str(raw_title or "").strip()
+    text = re.sub(r"^```(?:json|text|markdown)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text).strip()
+    if text:
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            for key in ("title", "summary", "\u6807\u9898", "\u6458\u8981"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    text = value.strip()
+                    break
+        elif isinstance(parsed, str) and parsed.strip():
+            text = parsed.strip()
+    title = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    title = title.strip(" \t\r\n\"'`“”‘’")
+    title = re.sub(r"^(?:title|summary|session title|\u6807\u9898|\u6458\u8981)\s*[:：]\s*", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^\s*[-*#]+\s*", "", title).strip()
+    title = title.strip(" \t\r\n\"'`“”‘’").rstrip(".。")
+    title = re.sub(r"\s+", " ", title).strip()
+    if not title and fallback:
+        title = fallback.strip()
     return title
+
+
+def _codex_title_length_issue(title: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not normalized:
+        return None
+    cjk_count = len(_CODEX_TITLE_CJK_RE.findall(normalized))
+    if cjk_count:
+        if cjk_count > _CODEX_TITLE_MAX_CJK_CHARS:
+            return f"Chinese title has {cjk_count} Chinese characters; use at most {_CODEX_TITLE_MAX_CJK_CHARS}."
+        if len(normalized) > _CODEX_TITLE_MAX_CHARS:
+            return f"Title has {len(normalized)} characters; use at most {_CODEX_TITLE_MAX_CHARS}."
+        return None
+    words = _CODEX_TITLE_WORD_RE.findall(normalized)
+    if words and len(words) > _CODEX_TITLE_MAX_WORDS:
+        return f"English title has {len(words)} words; use at most {_CODEX_TITLE_MAX_WORDS}."
+    if len(normalized) > _CODEX_TITLE_MAX_CHARS:
+        return f"Title has {len(normalized)} characters; use at most {_CODEX_TITLE_MAX_CHARS}."
+    return None
+
+
+def _codex_trim_title_to_limits(title: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not normalized:
+        return ""
+    if _CODEX_TITLE_CJK_RE.search(normalized):
+        chars: list[str] = []
+        cjk_count = 0
+        for char in normalized:
+            if _CODEX_TITLE_CJK_RE.match(char):
+                cjk_count += 1
+                if cjk_count > _CODEX_TITLE_MAX_CJK_CHARS:
+                    break
+                chars.append(char)
+            elif char.isascii() and (char.isalnum() or char in {" ", "-", "_", "/", "."}):
+                chars.append(char)
+        return re.sub(r"\s+", " ", "".join(chars)).strip(" \t\r\n-_/.,")
+    words = _CODEX_TITLE_WORD_RE.findall(normalized)
+    if words:
+        return " ".join(words[:_CODEX_TITLE_MAX_WORDS]).strip()
+    return normalized[:_CODEX_TITLE_MAX_CHARS].strip()
+
+
+def _codex_fallback_generated_title(message: str) -> str:
+    fallback = guard_service._fallback_runtime_session_title(str(message or ""))  # pyright: ignore[reportPrivateUsage]
+    cleaned = _codex_clean_generated_title(fallback, fallback="Codex")
+    if not cleaned:
+        return "Codex"
+    if _codex_title_length_issue(cleaned):
+        cleaned = _codex_trim_title_to_limits(cleaned)
+    return cleaned or "Codex"
 
 
 def _codex_title_generation_tool_error(message: dict[str, Any]) -> str | None:
@@ -3109,58 +3174,82 @@ async def _generate_codex_conversation_title(
         if not title_thread_id:
             raise CodexAppServerError("codex title generation did not return an ephemeral thread id")
 
-        turn_params: dict[str, Any] = {
-            "threadId": title_thread_id,
-            "input": [{"type": "text", "text": _codex_title_prompt(payload.message), "text_elements": []}],
-        }
-        if model_id:
-            turn_params["model"] = model_id
-        if payload.reasoning_effort:
-            turn_params["effort"] = payload.reasoning_effort
         service_tier = _codex_service_tier(payload.speed, model_id)
-        if service_tier:
-            turn_params["serviceTier"] = service_tier
+        title = ""
+        previous_title = ""
+        previous_issue = ""
+        for attempt in range(_CODEX_TITLE_MAX_ATTEMPTS):
+            turn_params: dict[str, Any] = {
+                "threadId": title_thread_id,
+                "input": [
+                    {
+                        "type": "text",
+                        "text": _codex_title_prompt(
+                            payload.message,
+                            previous_title=previous_title,
+                            length_issue=previous_issue,
+                        ),
+                        "text_elements": [],
+                    }
+                ],
+            }
+            if model_id:
+                turn_params["model"] = model_id
+            if payload.reasoning_effort:
+                turn_params["effort"] = payload.reasoning_effort
+            if service_tier:
+                turn_params["serviceTier"] = service_tier
 
-        await _codex_app_server_send(proc, {"id": 3, "method": "turn/start", "params": turn_params})
-        await _codex_app_server_response(proc, 3, timeout_s=timeout_s)
+            request_id = 3 + attempt
+            await _codex_app_server_send(proc, {"id": request_id, "method": "turn/start", "params": turn_params})
+            await _codex_app_server_response(proc, request_id, timeout_s=timeout_s)
 
-        raw_title_parts: list[str] = []
-        completed_agent_text = ""
-        while True:
-            message = await _read_codex_jsonrpc_message(proc, timeout_s=timeout_s)
-            tool_error = _codex_title_generation_tool_error(message)
-            if tool_error:
-                raise CodexAppServerError(tool_error)
-            method = _first_string(message.get("method")) or ""
-            params = message.get("params") if isinstance(message.get("params"), dict) else {}
-            if method == "item/agentMessage/delta":
-                raw_title_parts.append(_first_string(params.get("delta")) or "")
-            elif method == "item/completed":
-                item = params.get("item") if isinstance(params.get("item"), dict) else {}
-                item_type = _first_string(item.get("type"))
-                if item_type == "agentMessage":
-                    text = _first_string(item.get("text"), item.get("content"))
-                    if text:
-                        completed_agent_text = text
-            elif method == "error":
-                raise CodexAppServerError(_first_string(params.get("message"), params.get("error")) or "codex title generation failed")
-            elif method == "turn/completed":
+            raw_title_parts: list[str] = []
+            completed_agent_text = ""
+            while True:
+                message = await _read_codex_jsonrpc_message(proc, timeout_s=timeout_s)
+                tool_error = _codex_title_generation_tool_error(message)
+                if tool_error:
+                    raise CodexAppServerError(tool_error)
+                method = _first_string(message.get("method")) or ""
+                params = message.get("params") if isinstance(message.get("params"), dict) else {}
+                if method == "item/agentMessage/delta":
+                    raw_title_parts.append(_first_string(params.get("delta")) or "")
+                elif method == "item/completed":
+                    item = params.get("item") if isinstance(params.get("item"), dict) else {}
+                    item_type = _first_string(item.get("type"))
+                    if item_type == "agentMessage":
+                        text = _first_string(item.get("text"), item.get("content"))
+                        if text:
+                            completed_agent_text = text
+                elif method == "error":
+                    raise CodexAppServerError(_first_string(params.get("message"), params.get("error")) or "codex title generation failed")
+                elif method == "turn/completed":
+                    break
+
+            raw_title = "".join(raw_title_parts) or completed_agent_text
+            candidate_title = _codex_clean_generated_title(raw_title, fallback="")
+            if not candidate_title:
+                raise CodexAppServerError("codex title generation returned an empty title")
+            length_issue = _codex_title_length_issue(candidate_title)
+            if not length_issue:
+                title = candidate_title
                 break
+            previous_title = candidate_title
+            previous_issue = length_issue
 
-        raw_title = "".join(raw_title_parts) or completed_agent_text
-        title = _codex_clean_generated_title(raw_title, source_message=payload.message, fallback="")
         if not title:
-            raise CodexAppServerError("codex title generation returned an empty title")
+            title = _codex_fallback_generated_title(payload.message)
 
         await _codex_app_server_send(
             proc,
             {
-                "id": 4,
+                "id": 3 + _CODEX_TITLE_MAX_ATTEMPTS,
                 "method": "thread/name/set",
                 "params": {"threadId": payload.thread_id, "name": title},
             },
         )
-        await _codex_app_server_response(proc, 4, timeout_s=timeout_s)
+        await _codex_app_server_response(proc, 3 + _CODEX_TITLE_MAX_ATTEMPTS, timeout_s=timeout_s)
         return title
     finally:
         if proc is not None and proc.returncode is None:

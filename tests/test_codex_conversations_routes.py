@@ -282,12 +282,15 @@ class FakeTitleStdin(FakeConversationStdin):
         *,
         emit_tool: bool = False,
         title_delta: str | None = None,
+        title_deltas: list[str] | None = None,
         emit_normal_items: bool = False,
     ):
         super().__init__(queue, sent_messages)
         self._emit_tool = emit_tool
         self._title_delta = title_delta
+        self._title_deltas = title_deltas or []
         self._emit_normal_items = emit_normal_items
+        self._turn_start_count = 0
 
     def write(self, payload: bytes) -> None:
         message = json.loads(payload.decode("utf-8"))
@@ -314,6 +317,11 @@ class FakeTitleStdin(FakeConversationStdin):
                 + b"\n"
             )
         elif method == "turn/start":
+            title_delta = self._title_delta or "\u521b\u5efa\u591a\u9879\u5f0f\u6c42\u5bfc\u811a\u672c"
+            if self._title_deltas:
+                title_delta = self._title_deltas[min(self._turn_start_count, len(self._title_deltas) - 1)]
+            self._turn_start_count += 1
+            self._title_delta = title_delta
             self._queue.put_nowait(
                 json.dumps({"id": message["id"], "result": {"turn": {"id": "title-turn"}}}).encode("utf-8") + b"\n"
             )
@@ -422,6 +430,7 @@ class FakeTitleProcess(FakeConversationProcess):
         *,
         emit_tool: bool = False,
         title_delta: str | None = None,
+        title_deltas: list[str] | None = None,
         emit_normal_items: bool = False,
     ):
         self.returncode = None
@@ -431,6 +440,7 @@ class FakeTitleProcess(FakeConversationProcess):
             sent_messages,
             emit_tool=emit_tool,
             title_delta=title_delta,
+            title_deltas=title_deltas,
             emit_normal_items=emit_normal_items,
         )
         self.stdout = FakeConversationStdout(self._queue)
@@ -1195,29 +1205,63 @@ def test_codex_title_generation_rejects_tool_events_without_setting_real_title(m
     assert not any(message.get("method") == "thread/name/set" for message in sent_messages)
 
 
-def test_codex_title_generation_rejects_raw_request_without_setting_real_title(monkeypatch, tmp_path):
+def test_codex_title_generation_retries_overlong_title_before_setting_real_title(monkeypatch, tmp_path):
     codex_path = str(tmp_path / "codex.cmd")
     sent_messages: list[dict] = []
-    raw_request = "please create a polynomial derivative script with input validation and a command line demo"
+    overlong_title = "please create a polynomial derivative script with input validation and a command line demo"
+    generated_title = "Polynomial derivative script"
     monkeypatch.setattr(system_routes, "_find_codex", lambda **_: codex_path)
 
     async def fake_create_subprocess_exec(*_args, **_kwargs):
-        return FakeTitleProcess(sent_messages, title_delta=raw_request)
+        return FakeTitleProcess(sent_messages, title_deltas=[overlong_title, generated_title])
 
     monkeypatch.setattr(system_routes.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     client = TestClient(app)
 
     response = client.post(
         "/api/system/codex/conversations/codex%3Athread-real/title/generate",
-        json={"thread_id": "thread-real", "message": raw_request, "model": "GPT-5.5"},
+        json={"thread_id": "thread-real", "message": overlong_title, "model": "GPT-5.5"},
     )
 
-    assert response.status_code == 502
-    assert response.json()["detail"] == "codex title generation returned an empty title"
-    assert not any(message.get("method") == "thread/name/set" for message in sent_messages)
+    assert response.status_code == 200
+    assert response.json()["title"] == generated_title
+    turn_starts = [message for message in sent_messages if message.get("method") == "turn/start"]
+    assert len(turn_starts) == 2
+    retry_prompt = turn_starts[1]["params"]["input"][0]["text"]
+    assert "previous title was too long" in retry_prompt.lower()
+    assert "at most 8 words" in retry_prompt
+    name_params = next(message["params"] for message in sent_messages if message.get("method") == "thread/name/set")
+    assert name_params == {"threadId": "thread-real", "name": generated_title}
 
 
-def test_codex_title_generation_rejects_chinese_request_prefix_without_setting_real_title(monkeypatch, tmp_path):
+def test_codex_title_generation_uses_fallback_after_two_overlong_retries(monkeypatch, tmp_path):
+    codex_path = str(tmp_path / "codex.cmd")
+    sent_messages: list[dict] = []
+    overlong_title = "please create a polynomial derivative script with input validation and a command line demo"
+    monkeypatch.setattr(system_routes, "_find_codex", lambda **_: codex_path)
+
+    async def fake_create_subprocess_exec(*_args, **_kwargs):
+        return FakeTitleProcess(sent_messages, title_deltas=[overlong_title, overlong_title, overlong_title])
+
+    monkeypatch.setattr(system_routes.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/system/codex/conversations/codex%3Athread-real/title/generate",
+        json={"thread_id": "thread-real", "message": overlong_title, "model": "GPT-5.5"},
+    )
+
+    assert response.status_code == 200
+    turn_starts = [message for message in sent_messages if message.get("method") == "turn/start"]
+    assert len(turn_starts) == 3
+    assert response.json()["title"]
+    assert response.json()["title"] != overlong_title
+    name_params = next(message["params"] for message in sent_messages if message.get("method") == "thread/name/set")
+    assert name_params["threadId"] == "thread-real"
+    assert name_params["name"] == response.json()["title"]
+
+
+def test_codex_title_generation_accepts_concise_chinese_request_like_title(monkeypatch, tmp_path):
     codex_path = str(tmp_path / "codex.cmd")
     sent_messages: list[dict] = []
     raw_prefix = "\u5728\u5de5\u4f5c\u533a\u6839\u76ee\u5f55\u4e0b\u521b\u5efa"
@@ -1238,9 +1282,10 @@ def test_codex_title_generation_rejects_chinese_request_prefix_without_setting_r
         json={"thread_id": "thread-real", "message": raw_request, "model": "GPT-5.5"},
     )
 
-    assert response.status_code == 502
-    assert response.json()["detail"] == "codex title generation returned an empty title"
-    assert not any(message.get("method") == "thread/name/set" for message in sent_messages)
+    assert response.status_code == 200
+    assert response.json()["title"] == raw_prefix
+    name_params = next(message["params"] for message in sent_messages if message.get("method") == "thread/name/set")
+    assert name_params == {"threadId": "thread-real", "name": raw_prefix}
 
 
 def test_codex_title_generation_accepts_short_request_like_title(monkeypatch, tmp_path):
@@ -1266,7 +1311,7 @@ def test_codex_title_generation_accepts_short_request_like_title(monkeypatch, tm
     assert name_params == {"threadId": "thread-real", "name": short_title}
 
 
-def test_codex_title_generation_rejects_generic_codex_title_without_setting_real_title(monkeypatch, tmp_path):
+def test_codex_title_generation_accepts_generic_title_when_length_is_valid(monkeypatch, tmp_path):
     codex_path = str(tmp_path / "codex.cmd")
     sent_messages: list[dict] = []
     monkeypatch.setattr(system_routes, "_find_codex", lambda **_: codex_path)
@@ -1282,9 +1327,10 @@ def test_codex_title_generation_rejects_generic_codex_title_without_setting_real
         json={"thread_id": "thread-real", "message": "create a matrix transpose script", "model": "GPT-5.5"},
     )
 
-    assert response.status_code == 502
-    assert response.json()["detail"] == "codex title generation returned an empty title"
-    assert not any(message.get("method") == "thread/name/set" for message in sent_messages)
+    assert response.status_code == 200
+    assert response.json()["title"] == "Codex"
+    name_params = next(message["params"] for message in sent_messages if message.get("method") == "thread/name/set")
+    assert name_params == {"threadId": "thread-real", "name": "Codex"}
 
 
 def test_codex_conversation_start_fails_closed_when_prompt_cannot_load(monkeypatch, tmp_path):

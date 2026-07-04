@@ -1197,6 +1197,8 @@ const runtimeTitleRequestPatterns = [
   /^(?:please|can you|could you|help me|i want to|i need to|check|look up|find out)\b/i,
   /\b(?:what|why|how|whether)\b/i,
 ];
+void runtimeTitleRequestPatterns;
+
 const runtimeTitleLeadInPatterns = [
   /^(?:请帮我|麻烦帮我|帮我|帮忙|请问|请|麻烦|我想|我要|能不能|可以)/i,
   /^(?:查询一下|查一下|查查|看一下|了解一下)/i,
